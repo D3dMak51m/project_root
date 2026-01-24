@@ -3,6 +3,7 @@ from typing import List, Optional, Dict
 from uuid import UUID
 from src.core.domain.execution import ExecutionEligibilityResult
 from src.core.domain.window import ExecutionWindow
+from src.core.domain.window_decay import ExecutionWindowDecayResult
 
 
 @dataclass
@@ -30,6 +31,8 @@ class InternalContext:
     # Read-only map of intention eligibility
     execution_eligibility: Dict[UUID, ExecutionEligibilityResult] = field(default_factory=dict)
 
-    # [NEW] Transient execution window (if any)
-    # ThinkingEngine can observe this but cannot create or modify it.
+    # Transient execution window (if any)
     execution_window: Optional[ExecutionWindow] = None
+
+    # [NEW] Result of the last window decay check (if any)
+    last_window_decay: Optional[ExecutionWindowDecayResult] = None
