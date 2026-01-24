@@ -4,82 +4,87 @@ from src.core.domain.context import InternalContext
 from src.core.services.thinking import ThinkingService
 from src.core.services.internalization import InternalizationService
 from src.core.services.opinion import OpinionService
+from src.core.services.pressure import PressureService
 
 
 class LifeLoop:
-    """
-    The deterministic driver of the AIHuman.
-    It orchestrates the sequence:
-    Exist -> Perceive(Internal) -> Opinion -> Think -> Form Intention.
-    """
-
     def __init__(
             self,
             thinking_service: ThinkingService,
             internalization_service: InternalizationService,
-            opinion_service: OpinionService
+            opinion_service: OpinionService,
+            pressure_service: PressureService
     ):
         self.thinking_service = thinking_service
         self.internalization_service = internalization_service
         self.opinion_service = opinion_service
+        self.pressure_service = pressure_service
 
     def tick(self, human: AIHuman, current_time: datetime) -> None:
-        # 1. Passive Existence (Physics of the mind)
-        # Updates energy, fatigue, cleans up dead intentions
+        # 1. Passive Existence
         human.exist(current_time)
 
-        # 2. Check constraints (Fatigue check)
-        # If too tired, force rest or skip thinking
         if human.state.energy < 10.0:
             human.state.set_resting_state(True)
             return
 
-        # 3. Internalization (Perceive the World)
-        # This is a PULL operation. It returns a transient perception object.
-        # It does NOT trigger thinking directly.
+        # 2. Internalization
         perception = self.internalization_service.perceive_world(human)
 
-        # 4. Optional Memory Write (Decision belongs to LifeLoop logic)
+        # 3. Optional Memory Write
         if perception:
             memory_text = f"I noticed the world feels {perception.dominant_mood}. Topics: {', '.join(perception.interesting_topics)}."
             human.memory.add_short_term(memory_text, importance=0.2)
 
-        # 5. Form Internal Context (L3)
-        # Subjective snapshot of self
+        # 4. Form Context (Pre-Pressure)
         recent_memories = [m.content for m in human.memory.short_term_buffer[-3:]]
 
-        context = InternalContext.build(
+        # We build a temporary context to calculate pressure/opinions
+        temp_context = InternalContext.build(
             identity=human.identity,
             state=human.state,
             memories=recent_memories,
             intentions_count=len(human.intentions),
-            world_perception=perception  # Passed transiently
+            readiness=human.readiness,  # Current readiness
+            world_perception=perception
         )
 
-        # 6. Opinion Formation
-        # Evolve stance based on what was just perceived
-        self.opinion_service.form_opinions(human, context)
+        # 5. Opinion Formation
+        self.opinion_service.form_opinions(human, temp_context)
 
-        # 7. Enrich Context with Stance
-        # The thinking process should know about strong opinions
-        relevant_stances = self.opinion_service.get_relevant_stances(human, context)
-        if relevant_stances:
-            # We inject this into the context string (hacky for now, but effective)
-            context.recent_thoughts.extend(relevant_stances)
+        # 6. Pressure & Readiness Update [FIXED]
+        # Calculate delta
+        pressure_delta = self.pressure_service.calculate_delta(human, temp_context)
+
+        # Apply fatigue dampener (LifeLoop logic)
+        if human.state.fatigue > 70.0 and pressure_delta > 0:
+            pressure_delta *= 0.5  # Reduce accumulation if tired
+
+        # Apply to state
+        if pressure_delta > 0:
+            human.readiness.accumulate(pressure_delta)
+        else:
+            human.readiness.decay(abs(pressure_delta))
+
+        # 7. Re-build Context with Updated Readiness & Stance info
+        # This ensures Thinking sees the *result* of the pressure update
+        relevant_stances = self.opinion_service.get_relevant_stances(human, temp_context)
+        final_memories = recent_memories + relevant_stances
+
+        final_context = InternalContext.build(
+            identity=human.identity,
+            state=human.state,
+            memories=final_memories,
+            intentions_count=len(human.intentions),
+            readiness=human.readiness,  # Updated readiness
+            world_perception=perception
+        )
 
         # 8. Thinking Process
-        # Consumes resources
-        thought_content, new_intention = self.thinking_service.think(context, human.identity.name)
+        thought_content, new_intention = self.thinking_service.think(final_context, human.identity.name)
 
-        # Cost of thinking
         human.state.apply_resource_cost(energy_cost=2.0, attention_cost=5.0)
-
-        # 9. Persist Thought
         human.memory.add_short_term(content=thought_content, importance=0.1)
 
-        # 10. Register Intention (if any)
         if new_intention:
             human.add_intention(new_intention)
-
-        # 11. Inactivity Check
-        # If no intention formed, human remains silent (default behavior)

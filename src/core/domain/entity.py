@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from uuid import UUID, uuid4
 from datetime import datetime
 from typing import List
-
+from src.core.domain.readiness import ActionReadiness
 from src.core.domain.identity import Identity
 from src.core.domain.behavior import BehaviorState
 from src.core.domain.memory import MemorySystem
@@ -30,8 +30,7 @@ class AIHuman:
     goals: list[Goal]
     intentions: list[Intention]
     created_at: datetime
-
-    # REMOVED: last_perceived_world
+    readiness: ActionReadiness
 
     @classmethod
     def create(cls, identity: Identity) -> 'AIHuman':
@@ -43,7 +42,8 @@ class AIHuman:
             stance=Stance(),
             goals=[],
             intentions=[],
-            created_at=datetime.utcnow()
+            created_at=datetime.utcnow(),
+            readiness = ActionReadiness()
         )
 
     def exist(self, current_time: datetime = None):

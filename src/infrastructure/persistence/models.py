@@ -6,7 +6,6 @@ from datetime import datetime
 
 Base = declarative_base()
 
-
 class AIHumanModel(Base):
     __tablename__ = "ai_humans"
 
@@ -20,6 +19,7 @@ class AIHumanModel(Base):
     goals_data = Column(JSON, default=[])
     memory_data = Column(JSON, default={})
     intentions_data = Column(JSON, default=[])
+    readiness_value = Column(Float, default=0.0)
 
 class IdentityModel(Base):
     __tablename__ = "identities"

@@ -3,6 +3,7 @@ from uuid import UUID
 from typing import Optional
 from datetime import datetime
 
+from core.domain.readiness import ActionReadiness
 from src.core.domain.entity import AIHuman, Stance, Goal
 from src.core.domain.identity import Identity, PersonalityTraits
 from src.core.domain.behavior import BehaviorState
@@ -70,6 +71,7 @@ class AIHumanRepository:
                 ttl_seconds=i_data['ttl_seconds'],
                 metadata=i_data['metadata']
             ))
+        readiness = ActionReadiness(value=model.readiness_value)
 
         return AIHuman(
             id=model.id,
@@ -79,7 +81,8 @@ class AIHumanRepository:
             stance=stance,
             goals=goals,
             intentions=intentions,
-            created_at=model.created_at
+            created_at=model.created_at,
+            readiness=readiness
         )
 
     def _map_to_model(self, domain: AIHuman) -> AIHumanModel:
@@ -141,6 +144,7 @@ class AIHumanRepository:
             }
             for i in domain.intentions
         ]
+        model.readiness_value = domain.readiness.value
 
         return model
 
