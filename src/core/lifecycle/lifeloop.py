@@ -184,26 +184,30 @@ class LifeLoop:
         # 7. Strategic Filtering
         final_intentions = []
 
+        # Creating a default posture for the filter if not present
+        from src.core.domain.strategy import StrategicPosture
+        posture = getattr(human, 'strategy', StrategicPosture(
+            horizon_days=1,
+            engagement_policy=[],
+            risk_tolerance=0.5,
+            confidence_baseline=0.5,
+            persistence_factor=1.0
+        ))
+
         for intention in human.intentions:
+            # Updated call signature - removed readiness
             decision = self.strategy_filter.evaluate(
                 intention,
-                human.strategy,
-                human.readiness,
+                posture,
                 now
             )
 
             if decision.allow:
                 final_intentions.append(intention)
-            elif decision.defer:
-                deferred = DeferredAction(
-                    id=uuid4(),
-                    intention_id=intention.id,
-                    reason=decision.reason,
-                    resume_after=decision.suggested_resume_after or now
-                )
-                human.deferred_actions.append(deferred)
             elif decision.suppress:
+                # Silently drop
                 pass
+            # Defer branch removed entirely
 
         human.intentions = final_intentions
 
