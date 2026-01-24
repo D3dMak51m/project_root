@@ -17,7 +17,8 @@ class IntentionDecayService:
             state: BehaviorState,
             readiness: ActionReadiness,
             total_intentions: int,
-            now: datetime
+            now: datetime,
+            external_decay_factor: float = 1.0  # [NEW] External modulation
     ) -> Optional[Intention]:
         """
         Returns the updated Intention if it survives, or None if it expires.
@@ -45,8 +46,11 @@ class IntentionDecayService:
         if total_intentions > 3:
             decay_factor *= 1.2
 
+        # Apply external modulation (e.g. from execution feedback)
+        decay_factor *= external_decay_factor
+
         # 3. Apply Decay to Priority (Smooth float decay)
-        # Base decay rate per tick (assuming tick is roughly 1 unit of time for simulation)
+        # Base decay rate per tick
         priority_decrement = 0.1 * decay_factor
 
         new_priority = intention.priority - priority_decrement

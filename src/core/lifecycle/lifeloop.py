@@ -1,7 +1,8 @@
 from datetime import datetime
-from uuid import uuid4, UUID
+from uuid import uuid4
 import random
 from typing import Optional, Dict
+from dataclasses import dataclass
 
 from src.core.domain.entity import AIHuman
 from src.core.domain.intention import Intention, DeferredAction
@@ -12,6 +13,7 @@ from src.core.domain.window_decay import WindowDecayOutcome, ExecutionWindowDeca
 from src.core.domain.commitment import ExecutionCommitment
 from src.core.domain.execution_intent import ExecutionIntent
 from src.core.domain.execution_binding import ExecutionBindingSnapshot
+from src.core.domain.execution_result import ExecutionStatus, ExecutionFailureType
 from src.core.lifecycle.signals import LifeSignals
 from src.core.context.internal import InternalContext
 from src.core.services.impulse import ImpulseGenerator
@@ -24,6 +26,18 @@ from src.core.services.commitment import CommitmentEvaluator
 from src.core.services.window_decay import ExecutionWindowDecayService
 from src.core.services.resolution import CommitmentResolutionService
 from src.core.services.execution_binding import ExecutionBindingService
+
+
+@dataclass
+class FeedbackModulation:
+    """
+    Ephemeral structure to hold modulation coefficients derived from execution feedback.
+    Used to influence cognitive dynamics without direct mutation.
+    """
+    readiness_accumulation_factor: float = 1.0
+    readiness_decay_factor: float = 1.0
+    intention_decay_factor: float = 1.0
+    pressure_factor: float = 1.0
 
 
 class LifeLoop:
@@ -44,6 +58,47 @@ class LifeLoop:
             return None
         return random.choice(human.personas)
 
+    def _calculate_feedback_modulation(self, signals: LifeSignals) -> FeedbackModulation:
+        """
+        Translates execution feedback into physical modulation coefficients.
+        Pure logic, no side effects.
+        """
+        mod = FeedbackModulation()
+
+        if not signals.execution_feedback:
+            return mod
+
+        feedback = signals.execution_feedback
+
+        if feedback.status == ExecutionStatus.SUCCESS:
+            # Success -> Release tension, accelerate decay of old intentions
+            mod.readiness_accumulation_factor = 0.5
+            mod.readiness_decay_factor = 2.0
+            mod.intention_decay_factor = 2.0
+
+        elif feedback.status == ExecutionStatus.FAILED:
+            if feedback.failure_type == ExecutionFailureType.ENVIRONMENT:
+                # Environment failure -> Persistence (slower decay, higher accumulation)
+                mod.readiness_accumulation_factor = 1.2
+                mod.readiness_decay_factor = 0.5
+                mod.intention_decay_factor = 0.5
+            elif feedback.failure_type == ExecutionFailureType.INTERNAL:
+                # Internal error -> Slight dampening
+                mod.readiness_accumulation_factor = 0.9
+
+        elif feedback.status == ExecutionStatus.REJECTED:
+            if feedback.failure_type == ExecutionFailureType.POLICY:
+                # Policy block -> Suppression (slower accumulation, faster decay)
+                mod.readiness_accumulation_factor = 0.8
+                mod.readiness_decay_factor = 1.2
+
+        elif feedback.status == ExecutionStatus.PARTIAL:
+            # Partial -> Mixed release
+            mod.readiness_decay_factor = 1.5
+            mod.intention_decay_factor = 1.5
+
+        return mod
+
     def tick(
             self,
             human: AIHuman,
@@ -52,7 +107,7 @@ class LifeLoop:
             existing_window: Optional[ExecutionWindow] = None,
             existing_commitment: Optional[ExecutionCommitment] = None
     ) -> InternalContext:
-        # 1. Update State
+        # 1. Update State (Energy / Fatigue / Memory / Stance)
         human.state.set_resting(signals.rest)
 
         if signals.energy_delta < 0 or signals.attention_delta < 0:
@@ -77,38 +132,46 @@ class LifeLoop:
         for m in signals.memories:
             human.memory.add_short(m)
 
-        # 2. Intention Decay
+        # 2. Calculate Feedback Modulation [NEW]
+        modulation = self._calculate_feedback_modulation(signals)
+
+        # 3. Intention Decay & Inertia
         surviving_intentions = []
         total_intentions = len(human.intentions)
 
         for intention in human.intentions:
+            # Pass modulation factor to service instead of mutating intention
             updated_intention = self.intention_decay.evaluate(
                 intention=intention,
                 state=human.state,
                 readiness=human.readiness,
                 total_intentions=total_intentions,
-                now=now
+                now=now,
+                external_decay_factor=modulation.intention_decay_factor  # [NEW]
             )
             if updated_intention:
                 surviving_intentions.append(updated_intention)
 
         human.intentions = surviving_intentions
 
-        # 3. Intention Pressure
+        # 4. Intention Pressure
         pressure_delta = self.intention_pressure.calculate_pressure(
             human.intentions,
             human.state
         )
 
-        # 4. Update Readiness
+        # 5. Update Readiness
         total_pressure = signals.pressure_delta + pressure_delta
 
         if total_pressure > 0:
-            human.readiness.accumulate(total_pressure)
+            # Apply accumulation factor
+            human.readiness.accumulate(total_pressure * modulation.readiness_accumulation_factor)
         else:
-            human.readiness.decay(abs(total_pressure) if total_pressure < 0 else 2.0)
+            # Apply decay factor
+            base_decay = abs(total_pressure) if total_pressure < 0 else 2.0
+            human.readiness.decay(base_decay * modulation.readiness_decay_factor)
 
-        # 5. Physics of Volition
+        # 6. Physics of Volition
         temp_stance_snapshot = {
             topic: stance.intensity
             for topic, stance in human.stance.topics.items()
@@ -141,7 +204,7 @@ class LifeLoop:
                 human.intentions.append(new_intention)
                 human.state.apply_cost(energy_cost=5.0, attention_cost=2.0)
 
-        # 6. Strategic Filtering
+        # 7. Strategic Filtering
         final_intentions = []
 
         for intention in human.intentions:
@@ -167,14 +230,13 @@ class LifeLoop:
 
         human.intentions = final_intentions
 
-        # 7. Execution Window Logic
+        # 8. Execution Window Logic
 
         decay_result: Optional[ExecutionWindowDecayResult] = None
         active_window: Optional[ExecutionWindow] = None
         active_commitment: Optional[ExecutionCommitment] = existing_commitment
 
         if not active_commitment:
-            # A. Handle Existing Window (Decay)
             if existing_window:
                 decay_result = self.window_decay_service.evaluate(
                     window=existing_window,
@@ -188,7 +250,6 @@ class LifeLoop:
                 else:
                     active_window = None
 
-            # B. Handle New Window (Commitment) - Only if no active window
             eligibility_map: Dict[UUID, ExecutionEligibilityResult] = {}
 
             if not active_window:
@@ -219,7 +280,6 @@ class LifeLoop:
                             if new_window:
                                 active_window = new_window
 
-            # C. Commitment Resolution
             if active_window:
                 resolution_result = self.resolution_service.resolve(
                     window=active_window,
@@ -234,7 +294,7 @@ class LifeLoop:
                 if resolution_result.window_consumed:
                     active_window = None
 
-        # 8. Execution Binding (Projection)
+        # 9. Execution Binding (Projection)
         execution_intent: Optional[ExecutionIntent] = None
 
         if active_commitment:
@@ -250,7 +310,7 @@ class LifeLoop:
                 now=now
             )
 
-        # 9. Build Final InternalContext
+        # 10. Build Final InternalContext
         stance_snapshot = {
             topic: stance.intensity
             for topic, stance in human.stance.topics.items()
