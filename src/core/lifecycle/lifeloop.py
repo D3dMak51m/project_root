@@ -54,6 +54,12 @@ class LifeLoop:
             human.memory.add_short(m)
 
         # 6. Build InternalContext (READ-ONLY SNAPSHOT)
+        # Extract stance snapshot for context
+        stance_snapshot = {
+            topic: stance.intensity
+            for topic, stance in human.stance.topics.items()
+        }
+
         context = InternalContext(
             identity_summary=human.identity.name,
             current_mood="neutral",
@@ -66,7 +72,8 @@ class LifeLoop:
             active_intentions_count=len(human.intentions),
             readiness_level=human.readiness.level(),
             readiness_value=human.readiness.value,
-            world_perception=None
+            world_perception=None,
+            stance_snapshot=stance_snapshot  # [NEW] Inject snapshot
         )
 
         # 7. Physics of Volition (Impulse -> Intention)
@@ -82,7 +89,7 @@ class LifeLoop:
                     priority=int(candidate.pressure / 10),
                     created_at=now,
                     ttl_seconds=3600,  # Default TTL
-                    metadata={"origin": "impulse"}
+                    metadata={"origin": "impulse", "topic": candidate.topic}
                 )
                 human.intentions.append(new_intention)
 

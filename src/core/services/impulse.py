@@ -15,25 +15,27 @@ class ImpulseGenerator:
 
         # 1. Global Readiness Check
         # If overall readiness is low, no specific impulses can form.
-        if context.readiness_value < 60.0:
+        if context.readiness_value < 40.0:
             return []
 
         # 2. Stance-based Impulse Generation
-        # (In a real implementation, we would iterate over stance topics in context.
-        # For C.4 architecture, we simulate extraction from context signals)
+        # Iterate over read-only stance snapshot from context
+        for topic, intensity in context.stance_snapshot.items():
 
-        # Example logic: If a topic in recent thoughts has high pressure/intensity
-        # This relies on context being populated correctly in C.2
+            # Calculate local pressure for this topic
+            # Formula: Topic Intensity * Global Readiness Factor
+            # Example: 0.8 intensity * (80 readiness / 100) = 0.64 local pressure
 
-        # Mocking extraction for architectural demonstration:
-        # In production, InternalContext would carry structured Stance snapshots.
-        # Here we assume if readiness is high, we emit a generic candidate for the dominant pressure.
+            readiness_factor = context.readiness_value / 100.0
+            local_pressure = intensity * readiness_factor * 100.0
 
-        if context.readiness_value > 80.0:
-            candidates.append(IntentionCandidate(
-                topic="general_pressure",
-                pressure=context.readiness_value,
-                created_at=now
-            ))
+            # Threshold for impulse generation
+            # Must be significant enough to warrant attention
+            if local_pressure > 50.0:
+                candidates.append(IntentionCandidate(
+                    topic=topic,
+                    pressure=local_pressure,
+                    created_at=now
+                ))
 
         return candidates

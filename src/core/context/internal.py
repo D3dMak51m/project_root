@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict
 
 @dataclass
 class PerceivedWorldSummary:
@@ -18,3 +18,4 @@ class InternalContext:
     readiness_level: str
     readiness_value: float
     world_perception: Optional[PerceivedWorldSummary]
+    stance_snapshot: Dict[str, float] = field(default_factory=dict)
