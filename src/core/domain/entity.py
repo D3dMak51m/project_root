@@ -9,13 +9,11 @@ from src.core.domain.memory import MemorySystem
 
 @dataclass
 class Stance:
-    """Placeholder for opinions and red lines"""
     topics: dict = field(default_factory=dict)
 
 
 @dataclass
 class Goal:
-    """Placeholder for goals"""
     description: str
     priority: int
 
@@ -42,18 +40,14 @@ class AIHuman:
             created_at=datetime.utcnow()
         )
 
-    def live(self, current_time: datetime = None):
+    def exist(self, current_time: datetime = None):
         """
-        The heartbeat of the entity. Updates internal state based on time passed.
-        Does NOT trigger external actions.
+        Passive existence loop.
+        Updates internal state based on time passage.
+        NO decisions are made here.
+        NO actions are initiated here.
         """
         if current_time is None:
             current_time = datetime.utcnow()
 
-        self.state.update_over_time(current_time)
-
-    def rest(self):
-        self.state.start_rest()
-
-    def wake_up(self):
-        self.state.stop_rest()
+        self.state.evolve_passive_state(current_time)
