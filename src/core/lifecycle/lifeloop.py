@@ -1,14 +1,23 @@
 from datetime import datetime
+from uuid import uuid4
 from src.core.domain.entity import AIHuman
+from src.core.domain.intention import Intention
 from src.core.lifecycle.signals import LifeSignals
 from src.core.context.internal import InternalContext
+from src.core.services.impulse import ImpulseGenerator
+from src.core.services.intention_gate import IntentionGate
+
 
 class LifeLoop:
+    def __init__(self):
+        self.impulse_generator = ImpulseGenerator()
+        self.intention_gate = IntentionGate()
+
     def tick(
-        self,
-        human: AIHuman,
-        signals: LifeSignals,
-        now: datetime
+            self,
+            human: AIHuman,
+            signals: LifeSignals,
+            now: datetime
     ) -> InternalContext:
         # 1. Rest flag
         human.state.set_resting(signals.rest)
@@ -59,5 +68,25 @@ class LifeLoop:
             readiness_value=human.readiness.value,
             world_perception=None
         )
+
+        # 7. Physics of Volition (Impulse -> Intention)
+        candidates = self.impulse_generator.generate(context, now)
+
+        for candidate in candidates:
+            if self.intention_gate.allow(candidate, human.state):
+                # Crystallize Intention
+                new_intention = Intention(
+                    id=uuid4(),
+                    type="generated",
+                    content=f"Focus on {candidate.topic}",
+                    priority=int(candidate.pressure / 10),
+                    created_at=now,
+                    ttl_seconds=3600,  # Default TTL
+                    metadata={"origin": "impulse"}
+                )
+                human.intentions.append(new_intention)
+
+                # Cost of formation
+                human.state.apply_cost(energy_cost=5.0, attention_cost=2.0)
 
         return context
