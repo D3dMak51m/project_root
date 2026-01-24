@@ -9,6 +9,7 @@ from src.core.domain.persona import PersonaMask
 from src.core.domain.execution import ExecutionEligibilityResult
 from src.core.domain.window import ExecutionWindow
 from src.core.domain.window_decay import WindowDecayOutcome, ExecutionWindowDecayResult
+from src.core.domain.commitment import ExecutionCommitment
 from src.core.lifecycle.signals import LifeSignals
 from src.core.context.internal import InternalContext
 from src.core.services.impulse import ImpulseGenerator
@@ -19,6 +20,7 @@ from src.core.services.strategy_filter import StrategicFilterService
 from src.core.services.execution_eligibility import ExecutionEligibilityService
 from src.core.services.commitment import CommitmentEvaluator
 from src.core.services.window_decay import ExecutionWindowDecayService
+from src.core.services.resolution import CommitmentResolutionService
 
 
 class LifeLoop:
@@ -31,6 +33,7 @@ class LifeLoop:
         self.eligibility_service = ExecutionEligibilityService()
         self.commitment_evaluator = CommitmentEvaluator()
         self.window_decay_service = ExecutionWindowDecayService()
+        self.resolution_service = CommitmentResolutionService()
 
     def _select_mask(self, human: AIHuman) -> Optional[PersonaMask]:
         if not human.personas:
@@ -42,7 +45,8 @@ class LifeLoop:
             human: AIHuman,
             signals: LifeSignals,
             now: datetime,
-            existing_window: Optional[ExecutionWindow] = None
+            existing_window: Optional[ExecutionWindow] = None,
+            existing_commitment: Optional[ExecutionCommitment] = None
     ) -> InternalContext:
         # 1. Update State
         human.state.set_resting(signals.rest)
@@ -159,57 +163,72 @@ class LifeLoop:
 
         human.intentions = final_intentions
 
-        # 7. Execution Window Logic (Stateless)
+        # 7. Execution Window Logic
 
         decay_result: Optional[ExecutionWindowDecayResult] = None
         active_window: Optional[ExecutionWindow] = None
+        active_commitment: Optional[ExecutionCommitment] = existing_commitment
 
-        # A. Handle Existing Window (Decay)
-        if existing_window:
-            decay_result = self.window_decay_service.evaluate(
-                window=existing_window,
-                state=human.state,
-                readiness=human.readiness,
-                now=now
-            )
+        if not active_commitment:
+            # A. Handle Existing Window (Decay)
+            if existing_window:
+                decay_result = self.window_decay_service.evaluate(
+                    window=existing_window,
+                    state=human.state,
+                    readiness=human.readiness,
+                    now=now
+                )
 
-            if decay_result.outcome == WindowDecayOutcome.PERSIST:
-                active_window = existing_window
-            else:
-                # Window closed or invalidated
-                active_window = None
+                if decay_result.outcome == WindowDecayOutcome.PERSIST:
+                    active_window = existing_window
+                else:
+                    active_window = None
 
-        # B. Handle New Window (Commitment) - Only if no active window
-        eligibility_map: Dict[UUID, ExecutionEligibilityResult] = {}
+            # B. Handle New Window (Commitment) - Only if no active window
+            eligibility_map: Dict[UUID, ExecutionEligibilityResult] = {}
 
-        if not active_window:
-            mask = self._select_mask(human)
-            if mask:
-                sorted_intentions = sorted(human.intentions, key=lambda x: x.priority, reverse=True)
+            if not active_window:
+                mask = self._select_mask(human)
+                if mask:
+                    sorted_intentions = sorted(human.intentions, key=lambda x: x.priority, reverse=True)
 
-                for intention in sorted_intentions:
-                    eligibility = self.eligibility_service.evaluate(
-                        intention=intention,
-                        mask=mask,
-                        state=human.state,
-                        readiness=human.readiness,
-                        reputation=None,
-                        now=now
-                    )
-                    eligibility_map[intention.id] = eligibility
-
-                    if eligibility.allow and active_window is None:
-                        new_window = self.commitment_evaluator.evaluate(
+                    for intention in sorted_intentions:
+                        eligibility = self.eligibility_service.evaluate(
                             intention=intention,
-                            eligibility=eligibility,
                             mask=mask,
                             state=human.state,
                             readiness=human.readiness,
+                            reputation=None,
                             now=now
                         )
-                        if new_window:
-                            active_window = new_window
-                            # New windows bypass decay in the same tick
+                        eligibility_map[intention.id] = eligibility
+
+                        if eligibility.allow and active_window is None:
+                            new_window = self.commitment_evaluator.evaluate(
+                                intention=intention,
+                                eligibility=eligibility,
+                                mask=mask,
+                                state=human.state,
+                                readiness=human.readiness,
+                                now=now
+                            )
+                            if new_window:
+                                active_window = new_window
+
+            # C. Commitment Resolution
+            if active_window:
+                resolution_result = self.resolution_service.resolve(
+                    window=active_window,
+                    state=human.state,
+                    readiness=human.readiness,
+                    now=now
+                )
+
+                if resolution_result.commitment:
+                    active_commitment = resolution_result.commitment
+
+                if resolution_result.window_consumed:
+                    active_window = None
 
         # 8. Build Final InternalContext
         stance_snapshot = {
@@ -231,9 +250,10 @@ class LifeLoop:
             readiness_value=human.readiness.value,
             world_perception=None,
             stance_snapshot=stance_snapshot,
-            execution_eligibility=eligibility_map,
+            execution_eligibility=eligibility_map if not active_commitment else {},
             execution_window=active_window,
-            last_window_decay=decay_result
+            last_window_decay=decay_result,
+            execution_commitment=active_commitment
         )
 
         return context

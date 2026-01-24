@@ -9,6 +9,7 @@ class ExecutionWindow:
     Does NOT guarantee execution.
     Exists only within a single LifeLoop tick.
     """
+    id: UUID
     intention_id: UUID
     persona_id: UUID
     opened_at: datetime

@@ -4,6 +4,7 @@ from uuid import UUID
 from src.core.domain.execution import ExecutionEligibilityResult
 from src.core.domain.window import ExecutionWindow
 from src.core.domain.window_decay import ExecutionWindowDecayResult
+from src.core.domain.commitment import ExecutionCommitment
 
 
 @dataclass
@@ -34,5 +35,8 @@ class InternalContext:
     # Transient execution window (if any)
     execution_window: Optional[ExecutionWindow] = None
 
-    # [NEW] Result of the last window decay check (if any)
+    # Result of the last window decay check (if any)
     last_window_decay: Optional[ExecutionWindowDecayResult] = None
+
+    # [NEW] Irreversible commitment to act (if formed)
+    execution_commitment: Optional[ExecutionCommitment] = None

@@ -1,6 +1,7 @@
 import random
 from datetime import datetime, timedelta
 from typing import Optional
+from uuid import uuid4
 
 from src.core.domain.intention import Intention
 from src.core.domain.persona import PersonaMask
@@ -31,37 +32,26 @@ class CommitmentEvaluator:
             return None
 
         # 2. Readiness Check
-        # Even if eligible, readiness must be substantial for commitment
         if readiness.value < 60.0:
             return None
 
         # 3. Fatigue Check
-        # High fatigue reduces commitment probability drastically
         if state.fatigue > 60.0:
             return None
 
-        # 4. Probabilistic Filter (The "Hesitation" Factor)
-        # Base chance is low to ensure silence is default.
-        # Factors increasing chance:
-        # - High readiness
-        # - High intention priority
-        # - Low fatigue
-
+        # 4. Probabilistic Filter
         base_chance = 0.3
-        readiness_bonus = (readiness.value - 60.0) / 200.0  # Max +0.2
-        priority_bonus = (intention.priority / 20.0)  # Max +0.5 (if priority is 10)
+        readiness_bonus = (readiness.value - 60.0) / 200.0
+        priority_bonus = (intention.priority / 20.0)
 
-        total_chance = base_chance + readiness_bonus + priority_bonus
-
-        # Cap at 80% even in perfect conditions
-        total_chance = min(0.8, total_chance)
+        total_chance = min(0.8, base_chance + readiness_bonus + priority_bonus)
 
         if random.random() > total_chance:
             return None
 
         # 5. Open Window
-        # Window is short-lived (e.g., 5 seconds logical time)
         return ExecutionWindow(
+            id=uuid4(),
             intention_id=intention.id,
             persona_id=mask.id,
             opened_at=now,
