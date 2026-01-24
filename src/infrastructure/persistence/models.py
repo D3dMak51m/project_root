@@ -16,13 +16,10 @@ class AIHumanModel(Base):
     # Relationships
     identity = relationship("IdentityModel", back_populates="human", uselist=False, cascade="all, delete-orphan")
     state = relationship("BehaviorStateModel", back_populates="human", uselist=False, cascade="all, delete-orphan")
-    # Stance and Goals stored as JSON for flexibility in Stage 1
     stance_data = Column(JSON, default={})
     goals_data = Column(JSON, default=[])
-    # Memory is complex, storing basic structure as JSON for Stage 1,
-    # will evolve to vector references later
     memory_data = Column(JSON, default={})
-
+    intentions_data = Column(JSON, default=[])
 
 class IdentityModel(Base):
     __tablename__ = "identities"

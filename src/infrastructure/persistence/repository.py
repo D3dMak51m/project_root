@@ -1,7 +1,10 @@
+import datetime
+
 from sqlalchemy.orm import Session
 from uuid import UUID
 from typing import Optional
 
+from core.domain.intention import Intention
 from src.core.domain.entity import AIHuman, Stance, Goal
 from src.core.domain.identity import Identity, PersonalityTraits
 from src.core.domain.behavior import BehaviorState
@@ -44,6 +47,18 @@ class AIHumanRepository:
         stance = Stance(topics=model.stance_data)
         goals = [Goal(**g) for g in model.goals_data]
 
+        intentions = []
+        for i_data in model.intentions_data:
+            intentions.append(Intention(
+                id=UUID(i_data['id']),
+                type=i_data['type'],
+                content=i_data['content'],
+                priority=i_data['priority'],
+                created_at=datetime.fromisoformat(i_data['created_at']),
+                ttl_seconds=i_data['ttl_seconds'],
+                metadata=i_data['metadata']
+            ))
+
         return AIHuman(
             id=model.id,
             identity=identity,
@@ -51,7 +66,8 @@ class AIHumanRepository:
             memory=memory,
             stance=stance,
             goals=goals,
-            created_at=model.created_at
+            created_at=model.created_at,
+            intentions = intentions
         )
 
     def _map_to_model(self, domain: AIHuman) -> AIHumanModel:
@@ -90,6 +106,19 @@ class AIHumanRepository:
         model.stance_data = domain.stance.topics
         model.goals_data = [{"description": g.description, "priority": g.priority} for g in domain.goals]
         # Memory serialization logic would go here
+
+        model.intentions_data = [
+            {
+                "id": str(i.id),
+                "type": i.type,
+                "content": i.content,
+                "priority": i.priority,
+                "created_at": i.created_at.isoformat(),
+                "ttl_seconds": i.ttl_seconds,
+                "metadata": i.metadata
+            }
+            for i in domain.intentions
+        ]
 
         return model
 
