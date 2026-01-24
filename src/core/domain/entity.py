@@ -1,24 +1,15 @@
-from dataclasses import dataclass, field
-from uuid import UUID, uuid4
-from datetime import datetime
+from dataclasses import dataclass
 from typing import List
-from src.core.domain.readiness import ActionReadiness
-from src.core.domain.identity import Identity
-from src.core.domain.behavior import BehaviorState
-from src.core.domain.memory import MemorySystem
-from src.core.domain.intention import Intention
-from src.core.domain.persona import PersonaMask
+from uuid import UUID
+from datetime import datetime
 
-@dataclass
-class Stance:
-    topics: dict = field(default_factory=dict)
-
-
-@dataclass
-class Goal:
-    description: str
-    priority: int
-
+from .identity import Identity
+from .behavior import BehaviorState
+from .memory import MemorySystem
+from .stance import Stance
+from .readiness import ActionReadiness
+from .intention import Intention
+from .persona import PersonaMask
 
 @dataclass
 class AIHuman:
@@ -27,39 +18,7 @@ class AIHuman:
     state: BehaviorState
     memory: MemorySystem
     stance: Stance
-    goals: list[Goal]
-    intentions: list[Intention]
-    created_at: datetime
     readiness: ActionReadiness
+    intentions: List[Intention]
     personas: List[PersonaMask]
-
-    @classmethod
-    def create(cls, identity: Identity) -> 'AIHuman':
-        return cls(
-            id=uuid4(),
-            identity=identity,
-            state=BehaviorState(),
-            memory=MemorySystem(),
-            stance=Stance(),
-            goals=[],
-            intentions=[],
-            created_at=datetime.utcnow(),
-            readiness = ActionReadiness(),
-            personas=[]
-        )
-
-    def add_persona(self, persona: PersonaMask):
-        self.personas.append(persona)
-
-    def exist(self, current_time: datetime = None):
-        if current_time is None:
-            current_time = datetime.utcnow()
-        self.state.evolve_passive_state(current_time)
-        self._cleanup_expired_intentions(current_time)
-
-    def add_intention(self, intention: Intention):
-        self.intentions.append(intention)
-        self.intentions.sort(key=lambda x: x.priority, reverse=True)
-
-    def _cleanup_expired_intentions(self, current_time: datetime):
-        self.intentions = [i for i in self.intentions if not i.is_expired(current_time)]
+    created_at: datetime

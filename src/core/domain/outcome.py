@@ -1,0 +1,8 @@
+from enum import Enum
+
+class SocialOutcome(Enum):
+    POSITIVE_FEEDBACK = "POSITIVE_FEEDBACK"
+    NEGATIVE_FEEDBACK = "NEGATIVE_FEEDBACK"
+    NEUTRAL = "NEUTRAL"
+    IGNORED = "IGNORED"
+    BACKLASH = "BACKLASH"
