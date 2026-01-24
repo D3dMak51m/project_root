@@ -42,6 +42,5 @@ class InternalContext:
     # Irreversible commitment to act (if formed)
     execution_commitment: Optional[ExecutionCommitment] = None
 
-    # [NEW] Projection of commitment into actionable intent (if any)
-    # This is the boundary object visible to the outside world.
+    # Projection of commitment into actionable intent (if any)
     execution_intent: Optional[ExecutionIntent] = None
