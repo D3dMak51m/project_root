@@ -7,6 +7,7 @@ from src.core.domain.entity import AIHuman
 from src.core.domain.intention import Intention, DeferredAction
 from src.core.domain.persona import PersonaMask
 from src.core.domain.execution import ExecutionEligibilityResult
+from src.core.domain.window import ExecutionWindow
 from src.core.lifecycle.signals import LifeSignals
 from src.core.context.internal import InternalContext
 from src.core.services.impulse import ImpulseGenerator
@@ -15,6 +16,7 @@ from src.core.services.intention_decay import IntentionDecayService
 from src.core.services.intention_pressure import IntentionPressureService
 from src.core.services.strategy_filter import StrategicFilterService
 from src.core.services.execution_eligibility import ExecutionEligibilityService
+from src.core.services.commitment import CommitmentEvaluator
 
 
 class LifeLoop:
@@ -25,11 +27,9 @@ class LifeLoop:
         self.intention_pressure = IntentionPressureService()
         self.strategy_filter = StrategicFilterService()
         self.eligibility_service = ExecutionEligibilityService()
+        self.commitment_evaluator = CommitmentEvaluator()
 
     def _select_mask(self, human: AIHuman) -> Optional[PersonaMask]:
-        """
-        Simple strategy: Pick a random mask or based on some internal logic.
-        """
         if not human.personas:
             return None
         return random.choice(human.personas)
@@ -40,7 +40,7 @@ class LifeLoop:
             signals: LifeSignals,
             now: datetime
     ) -> InternalContext:
-        # 1. Update State (Energy / Fatigue / Memory / Stance)
+        # 1. Update State
         human.state.set_resting(signals.rest)
 
         if signals.energy_delta < 0 or signals.attention_delta < 0:
@@ -65,7 +65,7 @@ class LifeLoop:
         for m in signals.memories:
             human.memory.add_short(m)
 
-        # 2. Intention Decay & Inertia
+        # 2. Intention Decay
         surviving_intentions = []
         total_intentions = len(human.intentions)
 
@@ -96,9 +96,7 @@ class LifeLoop:
         else:
             human.readiness.decay(abs(total_pressure) if total_pressure < 0 else 2.0)
 
-        # 5. Physics of Volition (Impulse -> Intention)
-        # We need a temporary context for impulse generation to read readiness/stance
-        # This is a lightweight snapshot for internal logic
+        # 5. Physics of Volition
         temp_stance_snapshot = {
             topic: stance.intensity
             for topic, stance in human.stance.topics.items()
@@ -106,7 +104,7 @@ class LifeLoop:
         temp_context = InternalContext(
             identity_summary=human.identity.name,
             current_mood="neutral",
-            energy_level="moderate",  # Simplified for temp context
+            energy_level="moderate",
             recent_thoughts=[],
             active_intentions_count=len(human.intentions),
             readiness_level=human.readiness.level(),
@@ -157,14 +155,19 @@ class LifeLoop:
 
         human.intentions = final_intentions
 
-        # 7. Compute Execution Eligibility [NEW]
-        # Calculated for ALL surviving intentions BEFORE context finalization
+        # 7. Execution Eligibility & Commitment [NEW]
         eligibility_map: Dict[UUID, ExecutionEligibilityResult] = {}
+        execution_window: Optional[ExecutionWindow] = None
+
         mask = self._select_mask(human)
 
         if mask:
-            for intention in human.intentions:
-                result = self.eligibility_service.evaluate(
+            # Sort intentions by priority to check highest first
+            sorted_intentions = sorted(human.intentions, key=lambda x: x.priority, reverse=True)
+
+            for intention in sorted_intentions:
+                # A. Check Eligibility
+                eligibility = self.eligibility_service.evaluate(
                     intention=intention,
                     mask=mask,
                     state=human.state,
@@ -172,9 +175,21 @@ class LifeLoop:
                     reputation=None,
                     now=now
                 )
-                eligibility_map[intention.id] = result
+                eligibility_map[intention.id] = eligibility
 
-        # 8. Build Final InternalContext (READ-ONLY SNAPSHOT)
+                # B. Check Commitment (Only if eligible and no window yet)
+                # We only open ONE window per tick max
+                if eligibility.allow and execution_window is None:
+                    execution_window = self.commitment_evaluator.evaluate(
+                        intention=intention,
+                        eligibility=eligibility,
+                        mask=mask,
+                        state=human.state,
+                        readiness=human.readiness,
+                        now=now
+                    )
+
+        # 8. Build Final InternalContext
         stance_snapshot = {
             topic: stance.intensity
             for topic, stance in human.stance.topics.items()
@@ -194,7 +209,8 @@ class LifeLoop:
             readiness_value=human.readiness.value,
             world_perception=None,
             stance_snapshot=stance_snapshot,
-            execution_eligibility=eligibility_map  # [NEW] Injected into context
+            execution_eligibility=eligibility_map,
+            execution_window=execution_window  # [NEW] Injected into context
         )
 
         return context
