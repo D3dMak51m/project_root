@@ -1,5 +1,8 @@
 import random
 from datetime import datetime
+from typing import Optional
+
+from core.domain.persona import PersonaMask
 from src.core.domain.entity import AIHuman
 from src.core.domain.context import InternalContext
 from src.core.services.thinking import ThinkingService
@@ -7,6 +10,7 @@ from src.core.services.internalization import InternalizationService
 from src.core.services.opinion import OpinionService
 from src.core.services.pressure import PressureService
 from src.core.services.execution import ExecutionService
+from src.core.services.composer import ContentComposer
 
 
 class LifeLoop:
@@ -29,6 +33,15 @@ class LifeLoop:
         self.opinion_service = opinion_service
         self.pressure_service = pressure_service
         self.execution_service = execution_service
+
+    def _select_mask(self, human: AIHuman) -> Optional[PersonaMask]:
+        """
+        Simple strategy: Pick a random mask or based on some internal logic.
+        For Stage 8, random valid mask is sufficient.
+        """
+        if not human.personas:
+            return None
+        return random.choice(human.personas)
 
     def tick(self, human: AIHuman, current_time: datetime) -> None:
         # 1. Passive Existence (Physics of the mind)
@@ -111,22 +124,37 @@ class LifeLoop:
         if new_intention:
             human.add_intention(new_intention)
 
-        # 12. Execution Gate (Rare by Design)
-        # Only attempt execution 10% of the time to ensure silence is default
+        # 12. Execution Gate
         if random.random() < 0.1:
-            result = self.execution_service.execute_cycle(human)
+            # A. Get Intention
+            if not human.intentions:
+                return
+            intention = human.intentions[0]
 
-            # Apply mutations based on result
-            if result.readiness_decay > 0:
-                human.readiness.decay(result.readiness_decay)
+            # B. Propose Action (Pure Logic)
+            proposal = self.execution_service.propose_action(human, intention)
 
-            if result.success:
-                human.state.apply_resource_cost(result.energy_cost, attention_cost=10.0)
+            if proposal:
+                # C. Validate Proposal (Internal State)
+                if self.execution_service.validate_proposal(human, proposal):
 
-                # Remove executed intention
-                if result.executed_intention_id:
-                    human.intentions = [i for i in human.intentions if i.id != result.executed_intention_id]
+                    # D. Select Mask (LifeLoop Responsibility)
+                    mask = self._select_mask(human)
 
-                # Memory
-                if result.memory_content:
-                    human.memory.add_short_term(result.memory_content, importance=0.8)
+                    if mask:
+                        # E. Validate Mask (Time, Risk, etc.)
+                        if self.execution_service.validate_mask(mask, proposal, current_time):
+
+                            # F. Execute
+                            result = self.execution_service.execute_action(human, proposal, mask)
+
+                            # G. Apply Results
+                            if result.success:
+                                human.state.apply_resource_cost(result.energy_cost, attention_cost=10.0)
+                                human.readiness.decay(result.readiness_decay)
+                                if result.executed_intention_id:
+                                    human.intentions = [i for i in human.intentions if i.id != result.executed_intention_id]
+                                if result.memory_content:
+                                    human.memory.add_short_term(result.memory_content, importance=0.8)
+                            elif result.readiness_decay > 0:
+                                human.readiness.decay(result.readiness_decay)

@@ -3,6 +3,7 @@ from uuid import UUID
 from typing import Optional
 from datetime import datetime
 
+from core.domain.persona import PersonaMask
 from core.domain.readiness import ActionReadiness
 from src.core.domain.entity import AIHuman, Stance, Goal
 from src.core.domain.identity import Identity, PersonalityTraits
@@ -73,6 +74,22 @@ class AIHumanRepository:
             ))
         readiness = ActionReadiness(value=model.readiness_value)
 
+        personas = [
+            PersonaMask(
+                id=p.id,
+                human_id=p.human_id,
+                platform=p.platform,
+                display_name=p.display_name,
+                bio=p.bio,
+                language=p.language,
+                tone=p.tone,
+                verbosity=p.verbosity,
+                activity_rate=p.activity_rate,
+                risk_tolerance=p.risk_tolerance,
+                posting_hours=p.posting_hours
+            ) for p in model.personas
+        ]
+
         return AIHuman(
             id=model.id,
             identity=identity,
@@ -82,7 +99,8 @@ class AIHumanRepository:
             goals=goals,
             intentions=intentions,
             created_at=model.created_at,
-            readiness=readiness
+            readiness=readiness,
+            personas=personas
         )
 
     def _map_to_model(self, domain: AIHuman) -> AIHumanModel:

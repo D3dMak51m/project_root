@@ -7,7 +7,7 @@ from src.core.domain.identity import Identity
 from src.core.domain.behavior import BehaviorState
 from src.core.domain.memory import MemorySystem
 from src.core.domain.intention import Intention
-
+from src.core.domain.persona import PersonaMask
 
 @dataclass
 class Stance:
@@ -31,6 +31,7 @@ class AIHuman:
     intentions: list[Intention]
     created_at: datetime
     readiness: ActionReadiness
+    personas: List[PersonaMask]
 
     @classmethod
     def create(cls, identity: Identity) -> 'AIHuman':
@@ -43,8 +44,12 @@ class AIHuman:
             goals=[],
             intentions=[],
             created_at=datetime.utcnow(),
-            readiness = ActionReadiness()
+            readiness = ActionReadiness(),
+            personas=[]
         )
+
+    def add_persona(self, persona: PersonaMask):
+        self.personas.append(persona)
 
     def exist(self, current_time: datetime = None):
         if current_time is None:

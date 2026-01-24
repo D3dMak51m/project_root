@@ -8,9 +8,8 @@ from typing import Optional
 class ActionProposal:
     id: UUID
     intention_id: UUID
-    type: str
-    content: str
-    platform: str
+    type: str  # "post", "comment", "like"
+    content: str  # Semantic content, NOT final text
     risk_level: float
     energy_cost: float
     created_at: datetime
@@ -22,7 +21,7 @@ class ActionProposal:
             intention_id=intention_id,
             type=type,
             content=content,
-            platform="abstract",
+            # platform removed - proposal is platform-agnostic
             risk_level=risk,
             energy_cost=10.0 + (risk * 10.0),
             created_at=datetime.utcnow()
