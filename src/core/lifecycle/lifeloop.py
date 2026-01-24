@@ -7,6 +7,7 @@ from src.core.context.internal import InternalContext
 from src.core.services.impulse import ImpulseGenerator
 from src.core.services.intention_gate import IntentionGate
 from src.core.services.intention_decay import IntentionDecayService
+from src.core.services.intention_pressure import IntentionPressureService
 
 
 class LifeLoop:
@@ -14,6 +15,7 @@ class LifeLoop:
         self.impulse_generator = ImpulseGenerator()
         self.intention_gate = IntentionGate()
         self.intention_decay = IntentionDecayService()
+        self.intention_pressure = IntentionPressureService()
 
     def tick(
             self,
@@ -21,7 +23,7 @@ class LifeLoop:
             signals: LifeSignals,
             now: datetime
     ) -> InternalContext:
-        # 1. Update State (Energy / Fatigue / Memory / Readiness / Stance)
+        # 1. Update State (Energy / Fatigue / Memory / Stance)
         human.state.set_resting(signals.rest)
 
         if signals.energy_delta < 0 or signals.attention_delta < 0:
@@ -43,15 +45,45 @@ class LifeLoop:
                 now=now
             )
 
-        if signals.pressure_delta > 0:
-            human.readiness.accumulate(signals.pressure_delta)
-        else:
-            human.readiness.decay(abs(signals.pressure_delta))
-
         for m in signals.memories:
             human.memory.add_short(m)
 
-        # 2. Build InternalContext (READ-ONLY SNAPSHOT)
+        # 2. Intention Decay & Inertia (Physics of Persistence)
+        # Filter surviving intentions FIRST
+        surviving_intentions = []
+        total_intentions = len(human.intentions)
+
+        for intention in human.intentions:
+            updated_intention = self.intention_decay.evaluate(
+                intention=intention,
+                state=human.state,
+                readiness=human.readiness,
+                total_intentions=total_intentions,
+                now=now
+            )
+            if updated_intention:
+                surviving_intentions.append(updated_intention)
+
+        human.intentions = surviving_intentions
+
+        # 3. Intention Pressure (Feedback Loop) [NEW]
+        # Existing intentions generate pressure on readiness
+        pressure_delta = self.intention_pressure.calculate_pressure(
+            human.intentions,
+            human.state
+        )
+
+        # 4. Update Readiness
+        # Apply external signal pressure + internal intention pressure
+        total_pressure = signals.pressure_delta + pressure_delta
+
+        if total_pressure > 0:
+            human.readiness.accumulate(total_pressure)
+        else:
+            # Natural decay if no pressure
+            human.readiness.decay(abs(total_pressure) if total_pressure < 0 else 2.0)
+
+        # 5. Build InternalContext (READ-ONLY SNAPSHOT)
         stance_snapshot = {
             topic: stance.intensity
             for topic, stance in human.stance.topics.items()
@@ -73,17 +105,17 @@ class LifeLoop:
             stance_snapshot=stance_snapshot
         )
 
-        # 3. Generate IntentionCandidates (Physics of Volition)
+        # 6. Physics of Volition (Impulse -> Intention)
         candidates = self.impulse_generator.generate(context, now)
 
-        # 4. Crystallize New Intentions
         for candidate in candidates:
             if self.intention_gate.allow(candidate, human.state):
+                # Crystallize Intention
                 new_intention = Intention(
                     id=uuid4(),
                     type="generated",
                     content=f"Focus on {candidate.topic}",
-                    priority=float(candidate.pressure / 10.0),  # Float priority
+                    priority=float(candidate.pressure / 10.0),
                     created_at=now,
                     ttl_seconds=3600,
                     metadata={"origin": "impulse", "topic": candidate.topic}
@@ -93,27 +125,4 @@ class LifeLoop:
                 # Cost of formation
                 human.state.apply_cost(energy_cost=5.0, attention_cost=2.0)
 
-        # 5. Apply IntentionDecay to ALL intentions (old + new)
-        # This is the last mutating step for intentions in this tick
-        surviving_intentions = []
-        total_intentions = len(human.intentions)
-
-        for intention in human.intentions:
-            updated_intention = self.intention_decay.evaluate(
-                intention=intention,
-                state=human.state,
-                readiness=human.readiness,
-                total_intentions=total_intentions,
-                now=now
-            )
-            if updated_intention:
-                surviving_intentions.append(updated_intention)
-
-        # 6. Finalize human.intentions
-        human.intentions = surviving_intentions
-
-        # 7. Return InternalContext (Snapshot of state BEFORE decay/formation logic,
-        # or should it reflect post-tick state?
-        # Per instructions: "return InternalContext" is the last step.
-        # The context was built in step 2. We return that snapshot.)
         return context
