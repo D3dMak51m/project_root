@@ -2,12 +2,13 @@ from dataclasses import dataclass
 from uuid import UUID
 from datetime import datetime
 
+
 @dataclass(frozen=True)
 class ExecutionCommitment:
     """
     Irreversible intent to act.
     Represents the crossing of the Rubicon from 'opportunity' to 'decision'.
-    Does NOT contain execution details, only the will to execute.
+    Contains all semantic decisions made prior to binding.
     """
     id: UUID
     intention_id: UUID
@@ -15,3 +16,7 @@ class ExecutionCommitment:
     origin_window_id: UUID
     committed_at: datetime
     confidence: float
+
+    # [NEW] Semantic decisions fixed at commitment time
+    abstract_action: str
+    risk_level: float

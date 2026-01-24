@@ -5,6 +5,7 @@ from src.core.domain.execution import ExecutionEligibilityResult
 from src.core.domain.window import ExecutionWindow
 from src.core.domain.window_decay import ExecutionWindowDecayResult
 from src.core.domain.commitment import ExecutionCommitment
+from src.core.domain.execution_intent import ExecutionIntent
 
 
 @dataclass
@@ -38,5 +39,9 @@ class InternalContext:
     # Result of the last window decay check (if any)
     last_window_decay: Optional[ExecutionWindowDecayResult] = None
 
-    # [NEW] Irreversible commitment to act (if formed)
+    # Irreversible commitment to act (if formed)
     execution_commitment: Optional[ExecutionCommitment] = None
+
+    # [NEW] Projection of commitment into actionable intent (if any)
+    # This is the boundary object visible to the outside world.
+    execution_intent: Optional[ExecutionIntent] = None

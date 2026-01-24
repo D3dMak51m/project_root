@@ -58,13 +58,20 @@ class CommitmentResolutionService:
         # 4. Time-based Resolution
         time_left = (window.expires_at - now).total_seconds()
 
-        # Immediate commit for high confidence
-        if window.confidence > 0.7:
-            return self._create_commitment(window, now, "High confidence immediate commit")
+        # Calculate risk level at resolution time (snapshot)
+        # Higher readiness implies willingness to accept higher risk
+        current_risk_level = readiness.value / 100.0
 
-        # Commit on closing window
+        # Determine abstract action (Mock logic for C.9.2 context)
+        # In a real system, this would come from intention metadata or window context
+        abstract_action = "communicate"
+
+        if window.confidence > 0.7:
+            return self._create_commitment(window, now, "High confidence immediate commit", abstract_action,
+                                           current_risk_level)
+
         if time_left < 2.0:
-            return self._create_commitment(window, now, "Window closing commit")
+            return self._create_commitment(window, now, "Window closing commit", abstract_action, current_risk_level)
 
         return CommitmentResolutionResult(
             commitment=None,
@@ -72,14 +79,23 @@ class CommitmentResolutionService:
             reason="Waiting for optimal moment"
         )
 
-    def _create_commitment(self, window: ExecutionWindow, now: datetime, reason: str) -> CommitmentResolutionResult:
+    def _create_commitment(
+            self,
+            window: ExecutionWindow,
+            now: datetime,
+            reason: str,
+            abstract_action: str,
+            risk_level: float
+    ) -> CommitmentResolutionResult:
         commitment = ExecutionCommitment(
             id=uuid4(),
             intention_id=window.intention_id,
             persona_id=window.persona_id,
             origin_window_id=window.id,
             committed_at=now,
-            confidence=window.confidence
+            confidence=window.confidence,
+            abstract_action=abstract_action,
+            risk_level=risk_level
         )
         return CommitmentResolutionResult(
             commitment=commitment,

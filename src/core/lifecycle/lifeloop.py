@@ -10,6 +10,8 @@ from src.core.domain.execution import ExecutionEligibilityResult
 from src.core.domain.window import ExecutionWindow
 from src.core.domain.window_decay import WindowDecayOutcome, ExecutionWindowDecayResult
 from src.core.domain.commitment import ExecutionCommitment
+from src.core.domain.execution_intent import ExecutionIntent
+from src.core.domain.execution_binding import ExecutionBindingSnapshot
 from src.core.lifecycle.signals import LifeSignals
 from src.core.context.internal import InternalContext
 from src.core.services.impulse import ImpulseGenerator
@@ -21,6 +23,7 @@ from src.core.services.execution_eligibility import ExecutionEligibilityService
 from src.core.services.commitment import CommitmentEvaluator
 from src.core.services.window_decay import ExecutionWindowDecayService
 from src.core.services.resolution import CommitmentResolutionService
+from src.core.services.execution_binding import ExecutionBindingService
 
 
 class LifeLoop:
@@ -34,6 +37,7 @@ class LifeLoop:
         self.commitment_evaluator = CommitmentEvaluator()
         self.window_decay_service = ExecutionWindowDecayService()
         self.resolution_service = CommitmentResolutionService()
+        self.binding_service = ExecutionBindingService()
 
     def _select_mask(self, human: AIHuman) -> Optional[PersonaMask]:
         if not human.personas:
@@ -230,7 +234,23 @@ class LifeLoop:
                 if resolution_result.window_consumed:
                     active_window = None
 
-        # 8. Build Final InternalContext
+        # 8. Execution Binding (Projection)
+        execution_intent: Optional[ExecutionIntent] = None
+
+        if active_commitment:
+            binding_snapshot = ExecutionBindingSnapshot(
+                energy_value=human.state.energy,
+                fatigue_value=human.state.fatigue,
+                readiness_value=human.readiness.value
+            )
+
+            execution_intent = self.binding_service.bind(
+                commitment=active_commitment,
+                snapshot=binding_snapshot,
+                now=now
+            )
+
+        # 9. Build Final InternalContext
         stance_snapshot = {
             topic: stance.intensity
             for topic, stance in human.stance.topics.items()
@@ -253,7 +273,8 @@ class LifeLoop:
             execution_eligibility=eligibility_map if not active_commitment else {},
             execution_window=active_window,
             last_window_decay=decay_result,
-            execution_commitment=active_commitment
+            execution_commitment=active_commitment,
+            execution_intent=execution_intent
         )
 
         return context
