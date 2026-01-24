@@ -1,15 +1,16 @@
-import datetime
-
 from sqlalchemy.orm import Session
 from uuid import UUID
 from typing import Optional
+from datetime import datetime
 
-from core.domain.intention import Intention
 from src.core.domain.entity import AIHuman, Stance, Goal
 from src.core.domain.identity import Identity, PersonalityTraits
 from src.core.domain.behavior import BehaviorState
 from src.core.domain.memory import MemorySystem
+from src.core.domain.intention import Intention
+from src.core.domain.stance import TopicStance
 from src.infrastructure.persistence.models import AIHumanModel, IdentityModel, BehaviorStateModel
+
 
 class AIHumanRepository:
     def __init__(self, session: Session):
@@ -38,15 +39,26 @@ class AIHumanRepository:
             is_resting=model.state.is_resting
         )
 
-        # Map Memory (Simplified for Stage 1 JSON storage)
-        # In production Stage 2+, this would load from separate tables/vector DB
+        # Map Memory (Simplified for Stage 1-5 JSON storage)
         memory = MemorySystem()
-        # Logic to rehydrate memory from model.memory_data would go here
+        # Logic to rehydrate memory from model.memory_data would go here in future
 
-        # Map Stance & Goals
-        stance = Stance(topics=model.stance_data)
+        # Map Stance
+        stance = Stance()
+        if model.stance_data:
+            for topic, data in model.stance_data.items():
+                stance.topics[topic] = TopicStance(
+                    topic=topic,
+                    polarity=data["polarity"],
+                    intensity=data["intensity"],
+                    confidence=data["confidence"],
+                    last_updated=datetime.fromisoformat(data["last_updated"])
+                )
+
+        # Map Goals
         goals = [Goal(**g) for g in model.goals_data]
 
+        # Map Intentions
         intentions = []
         for i_data in model.intentions_data:
             intentions.append(Intention(
@@ -66,8 +78,8 @@ class AIHumanRepository:
             memory=memory,
             stance=stance,
             goals=goals,
-            created_at=model.created_at,
-            intentions = intentions
+            intentions=intentions,
+            created_at=model.created_at
         )
 
     def _map_to_model(self, domain: AIHuman) -> AIHumanModel:
@@ -102,11 +114,21 @@ class AIHumanRepository:
         model.state.last_update = domain.state.last_update
         model.state.is_resting = domain.state.is_resting
 
-        # Update JSON fields
-        model.stance_data = domain.stance.topics
-        model.goals_data = [{"description": g.description, "priority": g.priority} for g in domain.goals]
-        # Memory serialization logic would go here
+        # Update Stance (Serialize)
+        stance_dict = {}
+        for topic, s in domain.stance.topics.items():
+            stance_dict[topic] = {
+                "polarity": s.polarity,
+                "intensity": s.intensity,
+                "confidence": s.confidence,
+                "last_updated": s.last_updated.isoformat()
+            }
+        model.stance_data = stance_dict
 
+        # Update Goals
+        model.goals_data = [{"description": g.description, "priority": g.priority} for g in domain.goals]
+
+        # Update Intentions
         model.intentions_data = [
             {
                 "id": str(i.id),
