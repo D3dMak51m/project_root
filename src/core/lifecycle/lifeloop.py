@@ -1,13 +1,14 @@
 from datetime import datetime
 from uuid import uuid4
 from src.core.domain.entity import AIHuman
-from src.core.domain.intention import Intention
+from src.core.domain.intention import Intention, DeferredAction
 from src.core.lifecycle.signals import LifeSignals
 from src.core.context.internal import InternalContext
 from src.core.services.impulse import ImpulseGenerator
 from src.core.services.intention_gate import IntentionGate
 from src.core.services.intention_decay import IntentionDecayService
 from src.core.services.intention_pressure import IntentionPressureService
+from src.core.services.strategy_filter import StrategicFilterService
 
 
 class LifeLoop:
@@ -16,6 +17,7 @@ class LifeLoop:
         self.intention_gate = IntentionGate()
         self.intention_decay = IntentionDecayService()
         self.intention_pressure = IntentionPressureService()
+        self.strategy_filter = StrategicFilterService()
 
     def tick(
             self,
@@ -48,8 +50,7 @@ class LifeLoop:
         for m in signals.memories:
             human.memory.add_short(m)
 
-        # 2. Intention Decay & Inertia (Physics of Persistence)
-        # Filter surviving intentions FIRST
+        # 2. Intention Decay & Inertia
         surviving_intentions = []
         total_intentions = len(human.intentions)
 
@@ -66,24 +67,21 @@ class LifeLoop:
 
         human.intentions = surviving_intentions
 
-        # 3. Intention Pressure (Feedback Loop) [NEW]
-        # Existing intentions generate pressure on readiness
+        # 3. Intention Pressure
         pressure_delta = self.intention_pressure.calculate_pressure(
             human.intentions,
             human.state
         )
 
         # 4. Update Readiness
-        # Apply external signal pressure + internal intention pressure
         total_pressure = signals.pressure_delta + pressure_delta
 
         if total_pressure > 0:
             human.readiness.accumulate(total_pressure)
         else:
-            # Natural decay if no pressure
             human.readiness.decay(abs(total_pressure) if total_pressure < 0 else 2.0)
 
-        # 5. Build InternalContext (READ-ONLY SNAPSHOT)
+        # 5. Build InternalContext
         stance_snapshot = {
             topic: stance.intensity
             for topic, stance in human.stance.topics.items()
@@ -110,7 +108,6 @@ class LifeLoop:
 
         for candidate in candidates:
             if self.intention_gate.allow(candidate, human.state):
-                # Crystallize Intention
                 new_intention = Intention(
                     id=uuid4(),
                     type="generated",
@@ -121,8 +118,33 @@ class LifeLoop:
                     metadata={"origin": "impulse", "topic": candidate.topic}
                 )
                 human.intentions.append(new_intention)
-
-                # Cost of formation
                 human.state.apply_cost(energy_cost=5.0, attention_cost=2.0)
+
+        # 7. Strategic Filtering (The Cold Veto)
+        final_intentions = []
+
+        for intention in human.intentions:
+            decision = self.strategy_filter.evaluate(
+                intention,
+                human.strategy,
+                human.readiness,
+                now
+            )
+
+            if decision.allow:
+                final_intentions.append(intention)
+            elif decision.defer:
+                deferred = DeferredAction(
+                    id=uuid4(),
+                    intention_id=intention.id,
+                    reason=decision.reason,
+                    resume_after=decision.suggested_resume_after or now
+                )
+                human.deferred_actions.append(deferred)
+            elif decision.suppress:
+                # Silently drop
+                pass
+
+        human.intentions = final_intentions
 
         return context

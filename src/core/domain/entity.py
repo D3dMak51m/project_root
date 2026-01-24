@@ -8,8 +8,9 @@ from .behavior import BehaviorState
 from .memory import MemorySystem
 from .stance import Stance
 from .readiness import ActionReadiness
-from .intention import Intention
+from .intention import Intention, DeferredAction
 from .persona import PersonaMask
+from .strategy import StrategicPosture
 
 @dataclass
 class AIHuman:
@@ -21,4 +22,6 @@ class AIHuman:
     readiness: ActionReadiness
     intentions: List[Intention]
     personas: List[PersonaMask]
+    strategy: StrategicPosture
+    deferred_actions: List[DeferredAction]
     created_at: datetime
