@@ -2,52 +2,47 @@ from datetime import datetime
 from src.core.domain.entity import AIHuman
 from src.core.domain.context import InternalContext
 from src.core.services.thinking import ThinkingService
+from src.core.services.internalization import InternalizationService
 
 
 class LifeLoop:
-    """
-    The deterministic driver of the AIHuman.
-    It orchestrates the sequence: Exist -> Perceive(Internal) -> Think -> Form Intention.
-    """
-
-    def __init__(self, thinking_service: ThinkingService):
+    def __init__(self, thinking_service: ThinkingService, internalization_service: InternalizationService):
         self.thinking_service = thinking_service
+        self.internalization_service = internalization_service
 
     def tick(self, human: AIHuman, current_time: datetime) -> None:
-        # 1. Passive Existence (Physics of the mind)
-        # Updates energy, fatigue, cleans up dead intentions
+        # 1. Passive Existence
         human.exist(current_time)
 
-        # 2. Check constraints (Fatigue check)
-        # If too tired, force rest or skip thinking
         if human.state.energy < 10.0:
             human.state.set_resting_state(True)
             return
 
-        # 3. Form Internal Context (L3)
-        # Subjective snapshot of self
-        # In Stage 2, we fetch last 3 memories as "recent thoughts"
+        # 2. Internalization (Transient)
+        # Fetch perception, but do not store it in the human entity yet
+        perception = self.internalization_service.perceive_world(human)
+
+        # 3. Optional Memory Write (Decision belongs to LifeLoop logic for now)
+        if perception:
+            memory_text = f"I noticed the world feels {perception.dominant_mood}. Topics: {', '.join(perception.interesting_topics)}."
+            human.memory.add_short_term(memory_text, importance=0.2)
+
+        # 4. Form Internal Context (L3)
         recent_memories = [m.content for m in human.memory.short_term_buffer[-3:]]
+
         context = InternalContext.build(
             identity=human.identity,
             state=human.state,
             memories=recent_memories,
-            intentions_count=len(human.intentions)
+            intentions_count=len(human.intentions),
+            world_perception=perception  # Passed transiently
         )
 
-        # 4. Thinking Process
-        # Consumes resources
+        # 5. Thinking Process
         thought_content, new_intention = self.thinking_service.think(context, human.identity.name)
 
-        # Cost of thinking
         human.state.apply_resource_cost(energy_cost=2.0, attention_cost=5.0)
-
-        # 5. Persist Thought
         human.memory.add_short_term(content=thought_content, importance=0.1)
 
-        # 6. Register Intention (if any)
         if new_intention:
             human.add_intention(new_intention)
-
-        # 7. Inactivity Check
-        # If no intention formed, human remains silent (default behavior)
