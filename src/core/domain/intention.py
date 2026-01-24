@@ -8,7 +8,7 @@ class Intention:
     id: UUID
     type: str
     content: str
-    priority: int
+    priority: float
     created_at: datetime
     ttl_seconds: int
     metadata: Dict[str, Any]
