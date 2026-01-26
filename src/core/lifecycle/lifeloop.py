@@ -17,6 +17,7 @@ from src.core.domain.execution_result import ExecutionStatus, ExecutionFailureTy
 from src.core.domain.strategic_signals import StrategicSignals
 from src.core.domain.strategic_context import StrategicContext
 from src.core.domain.strategic_memory import StrategicMemory
+from src.core.domain.strategic_trajectory import StrategicTrajectoryMemory
 from src.core.lifecycle.signals import LifeSignals
 from src.core.context.internal import InternalContext
 from src.core.services.impulse import ImpulseGenerator
@@ -31,13 +32,13 @@ from src.core.services.resolution import CommitmentResolutionService
 from src.core.services.execution_binding import ExecutionBindingService
 from src.core.services.strategic_interpreter import StrategicFeedbackInterpreter
 from src.core.services.strategy_adaptation import StrategyAdaptationService
-from src.core.interfaces.strategic_memory_store import StrategicMemoryStore
-from src.core.services.horizon_shift import HorizonShiftService
-from src.core.domain.strategic_trajectory import StrategicTrajectoryMemory
 from src.core.services.strategic_trajectory import StrategicTrajectoryService
-from src.core.interfaces.strategic_trajectory_memory_store import StrategicTrajectoryMemoryStore
+from src.core.services.horizon_shift import HorizonShiftService
 from src.core.services.strategic_reflection import StrategicReflectionService
 from src.core.services.trajectory_rebinding import TrajectoryRebindingService
+from src.core.interfaces.strategic_memory_store import StrategicMemoryStore
+from src.core.interfaces.strategic_trajectory_memory_store import StrategicTrajectoryMemoryStore
+from src.core.services.path_key import extract_path_key
 
 
 @dataclass
@@ -46,6 +47,24 @@ class FeedbackModulation:
     readiness_decay_factor: float = 1.0
     intention_decay_factor: float = 1.0
     pressure_factor: float = 1.0
+
+
+class InMemoryStrategicMemoryStore(StrategicMemoryStore):
+    """
+    Simple in-memory store for C.16.2 demonstration.
+    In production, this would be a DB adapter.
+    """
+
+    def __init__(self):
+        self._store: Dict[str, StrategicMemory] = {}
+
+    def load(self, context: StrategicContext) -> StrategicMemory:
+        key = str(context)
+        return self._store.get(key, StrategicMemory())
+
+    def save(self, context: StrategicContext, memory: StrategicMemory) -> None:
+        key = str(context)
+        self._store[key] = memory
 
 
 class InMemoryStrategicTrajectoryMemoryStore(StrategicTrajectoryMemoryStore):
@@ -79,13 +98,17 @@ class LifeLoop:
         self.binding_service = ExecutionBindingService()
         self.strategic_interpreter = StrategicFeedbackInterpreter()
         self.strategy_adaptation = StrategyAdaptationService()
-        self.horizon_shift_service = HorizonShiftService()
         self.strategic_trajectory_service = StrategicTrajectoryService()
-        self.strategic_trajectory_memory_store = InMemoryStrategicTrajectoryMemoryStore()
+        self.horizon_shift_service = HorizonShiftService()
         self.strategic_reflection_service = StrategicReflectionService()
         self.trajectory_rebinding_service = TrajectoryRebindingService()
-        # Injected dependency (mock for now)
-        # self.strategic_memory_store = InMemoryStrategicMemoryStore()
+
+        # Injected dependencies (mock for now)
+        self.strategic_memory_store = InMemoryStrategicMemoryStore()
+        self.strategic_trajectory_memory_store = InMemoryStrategicTrajectoryMemoryStore()
+
+        # Transient state for window persistence across ticks
+        self._current_window: Optional[ExecutionWindow] = None
 
     def _select_mask(self, human: AIHuman) -> Optional[PersonaMask]:
         if not human.personas:
@@ -135,16 +158,28 @@ class LifeLoop:
             domain="social_media"
         )
 
-        # ... Steps 1 (Update State) ...
-        # (omitted for brevity)
-        strategic_context = StrategicContext("global", None, None, "social_media")
+        # 1. Update State
         human.state.set_resting(signals.rest)
+
         if signals.energy_delta < 0 or signals.attention_delta < 0:
-            human.state.apply_cost(abs(signals.energy_delta), abs(signals.attention_delta))
+            human.state.apply_cost(
+                energy_cost=abs(signals.energy_delta),
+                attention_cost=abs(signals.attention_delta)
+            )
         else:
-            human.state.recover(signals.energy_delta, signals.attention_delta)
-        for topic, (p, s) in signals.perceived_topics.items():
-            human.stance.update_topic(topic, p, s, now)
+            human.state.recover(
+                energy_gain=signals.energy_delta,
+                attention_gain=signals.attention_delta
+            )
+
+        for topic, (pressure, sentiment) in signals.perceived_topics.items():
+            human.stance.update_topic(
+                topic=topic,
+                pressure=pressure,
+                sentiment=sentiment,
+                now=now
+            )
+
         for m in signals.memories:
             human.memory.add_short(m)
 
@@ -159,6 +194,8 @@ class LifeLoop:
                 signals.execution_feedback
             )
 
+            # Ensure strategy exists
+            from src.core.domain.strategy import StrategicPosture, StrategicMode
             if not hasattr(human, 'strategy'):
                 human.strategy = StrategicPosture([], 0.5, 0.5, 1.0, StrategicMode.BALANCED)
 
@@ -182,7 +219,7 @@ class LifeLoop:
                 now
             )
 
-            # C. Strategic Reflection [NEW]
+            # C. Strategic Reflection
             reflections = self.strategic_reflection_service.reflect(
                 new_trajectory_memory,
                 new_memory,
@@ -191,7 +228,7 @@ class LifeLoop:
                 now
             )
 
-            # D. Trajectory Rebinding [NEW]
+            # D. Trajectory Rebinding
             final_trajectory_memory, rebindings = self.trajectory_rebinding_service.rebind(
                 new_trajectory_memory,
                 reflections,
