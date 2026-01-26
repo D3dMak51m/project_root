@@ -36,6 +36,8 @@ from src.core.services.horizon_shift import HorizonShiftService
 from src.core.domain.strategic_trajectory import StrategicTrajectoryMemory
 from src.core.services.strategic_trajectory import StrategicTrajectoryService
 from src.core.interfaces.strategic_trajectory_memory_store import StrategicTrajectoryMemoryStore
+from src.core.services.strategic_reflection import StrategicReflectionService
+from src.core.services.trajectory_rebinding import TrajectoryRebindingService
 
 
 @dataclass
@@ -80,6 +82,8 @@ class LifeLoop:
         self.horizon_shift_service = HorizonShiftService()
         self.strategic_trajectory_service = StrategicTrajectoryService()
         self.strategic_trajectory_memory_store = InMemoryStrategicTrajectoryMemoryStore()
+        self.strategic_reflection_service = StrategicReflectionService()
+        self.trajectory_rebinding_service = TrajectoryRebindingService()
         # Injected dependency (mock for now)
         # self.strategic_memory_store = InMemoryStrategicMemoryStore()
 
@@ -133,6 +137,7 @@ class LifeLoop:
 
         # ... Steps 1 (Update State) ...
         # (omitted for brevity)
+        strategic_context = StrategicContext("global", None, None, "social_media")
         human.state.set_resting(signals.rest)
         if signals.energy_delta < 0 or signals.attention_delta < 0:
             human.state.apply_cost(abs(signals.energy_delta), abs(signals.attention_delta))
@@ -154,12 +159,10 @@ class LifeLoop:
                 signals.execution_feedback
             )
 
-            # Ensure strategy exists
-            from src.core.domain.strategy import StrategicPosture, StrategicMode
             if not hasattr(human, 'strategy'):
                 human.strategy = StrategicPosture([], 0.5, 0.5, 1.0, StrategicMode.BALANCED)
 
-            # Adapt Strategy & Memory
+            # A. Adapt Strategy & Memory
             new_posture, new_memory = self.strategy_adaptation.adapt(
                 human.strategy,
                 current_memory,
@@ -169,7 +172,7 @@ class LifeLoop:
                 now
             )
 
-            # Update Trajectories (Competition Aware)
+            # B. Update Trajectories (Competition)
             new_trajectory_memory = self.strategic_trajectory_service.update(
                 current_trajectory_memory,
                 strategic_signals,
@@ -179,7 +182,24 @@ class LifeLoop:
                 now
             )
 
-            # Horizon Shift
+            # C. Strategic Reflection [NEW]
+            reflections = self.strategic_reflection_service.reflect(
+                new_trajectory_memory,
+                new_memory,
+                new_posture,
+                strategic_context,
+                now
+            )
+
+            # D. Trajectory Rebinding [NEW]
+            final_trajectory_memory, rebindings = self.trajectory_rebinding_service.rebind(
+                new_trajectory_memory,
+                reflections,
+                new_posture,
+                now
+            )
+
+            # E. Horizon Shift
             final_posture = self.horizon_shift_service.evaluate(
                 new_posture,
                 new_memory,
@@ -188,10 +208,10 @@ class LifeLoop:
 
             human.strategy = final_posture
             self.strategic_memory_store.save(strategic_context, new_memory)
-            self.strategic_trajectory_memory_store.save(strategic_context, new_trajectory_memory)
+            self.strategic_trajectory_memory_store.save(strategic_context, final_trajectory_memory)
 
             current_memory = new_memory
-            current_trajectory_memory = new_trajectory_memory
+            current_trajectory_memory = final_trajectory_memory
 
         # 3. Intention Decay & Inertia
         surviving_intentions = []
