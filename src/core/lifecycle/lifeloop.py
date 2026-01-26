@@ -32,7 +32,8 @@ from src.core.services.execution_binding import ExecutionBindingService
 from src.core.services.strategic_interpreter import StrategicFeedbackInterpreter
 from src.core.services.strategy_adaptation import StrategyAdaptationService
 from src.core.interfaces.strategic_memory_store import StrategicMemoryStore
-
+from src.core.services.horizon_shift import HorizonShiftService
+from src.core.domain.strategy import StrategicPosture, StrategicMode
 
 @dataclass
 class FeedbackModulation:
@@ -74,7 +75,7 @@ class LifeLoop:
         self.binding_service = ExecutionBindingService()
         self.strategic_interpreter = StrategicFeedbackInterpreter()
         self.strategy_adaptation = StrategyAdaptationService()
-
+        self.horizon_shift_service = HorizonShiftService()
         # Injected dependency (mock for now)
         self.strategic_memory_store = InMemoryStrategicMemoryStore()
 
@@ -148,12 +149,11 @@ class LifeLoop:
                 signals.execution_feedback
             )
 
-            # Ensure strategy exists
-            from src.core.domain.strategy import StrategicPosture
+            # Ensure strategy exists with new defaults
             if not hasattr(human, 'strategy'):
-                human.strategy = StrategicPosture(1, [], 0.5, 0.5, 1.0)
+                human.strategy = StrategicPosture([], 0.5, 0.5, 1.0, StrategicMode.BALANCED)
 
-            # Adapt Strategy & Memory (Context-Scoped)
+            # Adapt Strategy & Memory
             new_posture, new_memory = self.strategy_adaptation.adapt(
                 human.strategy,
                 current_memory,
@@ -163,7 +163,15 @@ class LifeLoop:
                 now
             )
 
-            human.strategy = new_posture
+            # Horizon Shift [NEW]
+            # Evaluate mode shift based on updated posture and memory
+            final_posture = self.horizon_shift_service.evaluate(
+                new_posture,
+                new_memory,
+                now
+            )
+
+            human.strategy = final_posture
             self.strategic_memory_store.save(strategic_context, new_memory)
             current_memory = new_memory
 
@@ -233,16 +241,16 @@ class LifeLoop:
                 human.intentions.append(new_intention)
                 human.state.apply_cost(energy_cost=5.0, attention_cost=2.0)
 
-        # 7. Strategic Filtering (Memory-Aware with Cooldown)
+        # 7. Strategic Filtering (Mode-Aware)
         final_intentions = []
 
-        from src.core.domain.strategy import StrategicPosture
-        posture = getattr(human, 'strategy', StrategicPosture(1, [], 0.5, 0.5, 1.0))
+        if not hasattr(human, 'strategy'):
+            human.strategy = StrategicPosture([], 0.5, 0.5, 1.0, StrategicMode.BALANCED)
 
         for intention in human.intentions:
             decision = self.strategy_filter.evaluate(
                 intention,
-                posture,
+                human.strategy,
                 current_memory,
                 strategic_context,
                 now
