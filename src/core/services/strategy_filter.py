@@ -27,7 +27,7 @@ class StrategicFilterService:
             intention: Intention,
             posture: StrategicPosture,
             memory: StrategicMemory,
-            trajectory_memory: StrategicTrajectoryMemory,  # [NEW]
+            trajectory_memory: StrategicTrajectoryMemory,
             context: StrategicContext,
             now: datetime
     ) -> StrategicFilterResult:
@@ -35,18 +35,27 @@ class StrategicFilterService:
         path_key = extract_path_key(intention, context)
         path_status = memory.get_status(path_key)
 
-        # Get relevant trajectory (simplified mapping)
+        # Get relevant trajectory
         trajectory_id = context.domain
         trajectory = trajectory_memory.get_trajectory(trajectory_id)
 
         # Trajectory Influence Calculation
         trajectory_bonus = 0.0
         if trajectory and trajectory.status == TrajectoryStatus.ACTIVE:
-            # Active trajectory increases tolerance
             trajectory_bonus = trajectory.commitment_weight * 0.2
 
+        # [NEW] Trajectory Status Check
+        # In TACTICAL mode, suppress intentions not belonging to ACTIVE trajectories
+        # unless it's a new exploration (no trajectory yet)
+        if posture.mode == StrategicMode.TACTICAL:
+            if trajectory and trajectory.status != TrajectoryStatus.ACTIVE:
+                return StrategicFilterResult(
+                    allow=False,
+                    suppress=True,
+                    reason="Non-active trajectory suppressed in TACTICAL mode"
+                )
+
         # 1. Strategic Memory Check (Abandonment) - HARD GATE
-        # Trajectories CANNOT override hard abandonment
         if path_status.abandonment_level == "hard":
             return StrategicFilterResult(
                 allow=False,
@@ -55,8 +64,6 @@ class StrategicFilterService:
             )
 
         if path_status.abandonment_level == "soft":
-            # Trajectories MAY allow retry if commitment is high enough
-            # Only in BALANCED or STRATEGIC modes
             can_override_soft = (
                     posture.mode != StrategicMode.TACTICAL and
                     trajectory and
@@ -80,7 +87,6 @@ class StrategicFilterService:
             )
 
         # 3. Risk Tolerance Check (Semantic)
-        # Trajectory bonus applies here
         intention_risk = intention.metadata.get("risk_estimate", 0.0)
         effective_tolerance = posture.risk_tolerance + trajectory_bonus
 
@@ -88,7 +94,7 @@ class StrategicFilterService:
             return StrategicFilterResult(
                 allow=False,
                 suppress=True,
-                reason="Risk estimate exceeds strategic tolerance (even with trajectory bonus)"
+                reason="Risk estimate exceeds strategic tolerance"
             )
 
         # 4. Horizon/Mode Compatibility Check (Semantic)
@@ -99,7 +105,6 @@ class StrategicFilterService:
                     suppress=True,
                     reason="Long-horizon intention suppressed in TACTICAL mode"
                 )
-            # Stricter risk check in tactical mode (ignore trajectory bonus)
             if intention_risk > 0.3:
                 return StrategicFilterResult(
                     allow=False,

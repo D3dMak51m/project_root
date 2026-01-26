@@ -12,7 +12,7 @@ class StrategicTrajectoryService:
     """
     Pure service. Updates strategic trajectories based on signals.
     Manages commitment weight and status transitions.
-    Integrates competition logic with semantic awareness.
+    Integrates competition logic.
     """
 
     def __init__(self):
@@ -24,11 +24,12 @@ class StrategicTrajectoryService:
             signals: StrategicSignals,
             intent: ExecutionIntent,
             context: StrategicContext,
-            posture: StrategicPosture,
+            posture: StrategicPosture,  # [NEW] Needed for competition
             now: datetime
     ) -> StrategicTrajectoryMemory:
 
         # 1. Local Update (Existing Logic)
+        # Determine trajectory ID from context (TEMP / PLACEHOLDER for C.18.1)
         trajectory_id = context.domain
 
         current_trajectory = memory.get_trajectory(trajectory_id)
@@ -78,11 +79,10 @@ class StrategicTrajectoryService:
             new_trajectories[trajectory_id] = updated_trajectory
             updated_memory = StrategicTrajectoryMemory(trajectories=new_trajectories)
 
-        # 2. Global Competition (Semantic & Decay Aware)
-        final_memory, _ = self.competition_service.compete(
+        # 2. Global Competition (New Logic)
+        final_memory = self.competition_service.compete(
             updated_memory,
             posture,
-            signals,  # Pass signals for semantic boosting
             now
         )
 

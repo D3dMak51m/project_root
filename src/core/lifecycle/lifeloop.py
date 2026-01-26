@@ -37,6 +37,7 @@ from src.core.domain.strategic_trajectory import StrategicTrajectoryMemory
 from src.core.services.strategic_trajectory import StrategicTrajectoryService
 from src.core.interfaces.strategic_trajectory_memory_store import StrategicTrajectoryMemoryStore
 
+
 @dataclass
 class FeedbackModulation:
     readiness_accumulation_factor: float = 1.0
@@ -49,6 +50,7 @@ class InMemoryStrategicTrajectoryMemoryStore(StrategicTrajectoryMemoryStore):
     """
     Simple in-memory store for C.18.1 demonstration.
     """
+
     def __init__(self):
         self._store: Dict[str, StrategicTrajectoryMemory] = {}
 
@@ -145,7 +147,7 @@ class LifeLoop:
         modulation = self._calculate_feedback_modulation(signals)
 
         current_memory = self.strategic_memory_store.load(strategic_context)
-        current_trajectory_memory = self.strategic_trajectory_memory_store.load(strategic_context)  # [NEW]
+        current_trajectory_memory = self.strategic_trajectory_memory_store.load(strategic_context)
 
         if signals.execution_feedback and last_executed_intent:
             strategic_signals = self.strategic_interpreter.interpret(
@@ -167,12 +169,13 @@ class LifeLoop:
                 now
             )
 
-            # Update Trajectories [UPDATED]
+            # Update Trajectories (Competition Aware)
             new_trajectory_memory = self.strategic_trajectory_service.update(
                 current_trajectory_memory,
                 strategic_signals,
-                last_executed_intent,  # Pass intent
+                last_executed_intent,
                 strategic_context,
+                new_posture,
                 now
             )
 
@@ -185,7 +188,7 @@ class LifeLoop:
 
             human.strategy = final_posture
             self.strategic_memory_store.save(strategic_context, new_memory)
-            self.strategic_trajectory_memory_store.save(strategic_context, new_trajectory_memory)  # Save to store
+            self.strategic_trajectory_memory_store.save(strategic_context, new_trajectory_memory)
 
             current_memory = new_memory
             current_trajectory_memory = new_trajectory_memory
@@ -267,7 +270,7 @@ class LifeLoop:
                 intention,
                 human.strategy,
                 current_memory,
-                current_trajectory_memory,  # Pass loaded trajectory memory
+                current_trajectory_memory,
                 strategic_context,
                 now
             )
