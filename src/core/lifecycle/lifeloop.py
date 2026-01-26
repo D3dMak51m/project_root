@@ -33,7 +33,9 @@ from src.core.services.strategic_interpreter import StrategicFeedbackInterpreter
 from src.core.services.strategy_adaptation import StrategyAdaptationService
 from src.core.interfaces.strategic_memory_store import StrategicMemoryStore
 from src.core.services.horizon_shift import HorizonShiftService
-from src.core.domain.strategy import StrategicPosture, StrategicMode
+from src.core.domain.strategic_trajectory import StrategicTrajectoryMemory
+from src.core.services.strategic_trajectory import StrategicTrajectoryService
+from src.core.interfaces.strategic_trajectory_memory_store import StrategicTrajectoryMemoryStore
 
 @dataclass
 class FeedbackModulation:
@@ -43,20 +45,18 @@ class FeedbackModulation:
     pressure_factor: float = 1.0
 
 
-class InMemoryStrategicMemoryStore(StrategicMemoryStore):
+class InMemoryStrategicTrajectoryMemoryStore(StrategicTrajectoryMemoryStore):
     """
-    Simple in-memory store for C.16.2 demonstration.
-    In production, this would be a DB adapter.
+    Simple in-memory store for C.18.1 demonstration.
     """
-
     def __init__(self):
-        self._store: Dict[str, StrategicMemory] = {}
+        self._store: Dict[str, StrategicTrajectoryMemory] = {}
 
-    def load(self, context: StrategicContext) -> StrategicMemory:
+    def load(self, context: StrategicContext) -> StrategicTrajectoryMemory:
         key = str(context)
-        return self._store.get(key, StrategicMemory())
+        return self._store.get(key, StrategicTrajectoryMemory())
 
-    def save(self, context: StrategicContext, memory: StrategicMemory) -> None:
+    def save(self, context: StrategicContext, memory: StrategicTrajectoryMemory) -> None:
         key = str(context)
         self._store[key] = memory
 
@@ -76,8 +76,10 @@ class LifeLoop:
         self.strategic_interpreter = StrategicFeedbackInterpreter()
         self.strategy_adaptation = StrategyAdaptationService()
         self.horizon_shift_service = HorizonShiftService()
+        self.strategic_trajectory_service = StrategicTrajectoryService()
+        self.strategic_trajectory_memory_store = InMemoryStrategicTrajectoryMemoryStore()
         # Injected dependency (mock for now)
-        self.strategic_memory_store = InMemoryStrategicMemoryStore()
+        # self.strategic_memory_store = InMemoryStrategicMemoryStore()
 
     def _select_mask(self, human: AIHuman) -> Optional[PersonaMask]:
         if not human.personas:
@@ -127,8 +129,8 @@ class LifeLoop:
             domain="social_media"
         )
 
-        # Steps 1 (Update State) ...
-        # (omitted for brevity, same as before)
+        # ... Steps 1 (Update State) ...
+        # (omitted for brevity)
         human.state.set_resting(signals.rest)
         if signals.energy_delta < 0 or signals.attention_delta < 0:
             human.state.apply_cost(abs(signals.energy_delta), abs(signals.attention_delta))
@@ -143,13 +145,15 @@ class LifeLoop:
         modulation = self._calculate_feedback_modulation(signals)
 
         current_memory = self.strategic_memory_store.load(strategic_context)
+        current_trajectory_memory = self.strategic_trajectory_memory_store.load(strategic_context)  # [NEW]
 
         if signals.execution_feedback and last_executed_intent:
             strategic_signals = self.strategic_interpreter.interpret(
                 signals.execution_feedback
             )
 
-            # Ensure strategy exists with new defaults
+            # Ensure strategy exists
+            from src.core.domain.strategy import StrategicPosture, StrategicMode
             if not hasattr(human, 'strategy'):
                 human.strategy = StrategicPosture([], 0.5, 0.5, 1.0, StrategicMode.BALANCED)
 
@@ -163,8 +167,16 @@ class LifeLoop:
                 now
             )
 
-            # Horizon Shift [NEW]
-            # Evaluate mode shift based on updated posture and memory
+            # Update Trajectories [UPDATED]
+            new_trajectory_memory = self.strategic_trajectory_service.update(
+                current_trajectory_memory,
+                strategic_signals,
+                last_executed_intent,  # Pass intent
+                strategic_context,
+                now
+            )
+
+            # Horizon Shift
             final_posture = self.horizon_shift_service.evaluate(
                 new_posture,
                 new_memory,
@@ -173,7 +185,10 @@ class LifeLoop:
 
             human.strategy = final_posture
             self.strategic_memory_store.save(strategic_context, new_memory)
+            self.strategic_trajectory_memory_store.save(strategic_context, new_trajectory_memory)  # Save to store
+
             current_memory = new_memory
+            current_trajectory_memory = new_trajectory_memory
 
         # 3. Intention Decay & Inertia
         surviving_intentions = []
@@ -241,7 +256,7 @@ class LifeLoop:
                 human.intentions.append(new_intention)
                 human.state.apply_cost(energy_cost=5.0, attention_cost=2.0)
 
-        # 7. Strategic Filtering (Mode-Aware)
+        # 7. Strategic Filtering (Memory & Trajectory Aware)
         final_intentions = []
 
         if not hasattr(human, 'strategy'):
@@ -252,6 +267,7 @@ class LifeLoop:
                 intention,
                 human.strategy,
                 current_memory,
+                current_trajectory_memory,  # Pass loaded trajectory memory
                 strategic_context,
                 now
             )
