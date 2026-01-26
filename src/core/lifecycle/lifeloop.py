@@ -14,6 +14,9 @@ from src.core.domain.commitment import ExecutionCommitment
 from src.core.domain.execution_intent import ExecutionIntent
 from src.core.domain.execution_binding import ExecutionBindingSnapshot
 from src.core.domain.execution_result import ExecutionStatus, ExecutionFailureType
+from src.core.domain.strategic_signals import StrategicSignals
+from src.core.domain.strategic_context import StrategicContext
+from src.core.domain.strategic_memory import StrategicMemory
 from src.core.lifecycle.signals import LifeSignals
 from src.core.context.internal import InternalContext
 from src.core.services.impulse import ImpulseGenerator
@@ -26,6 +29,9 @@ from src.core.services.commitment import CommitmentEvaluator
 from src.core.services.window_decay import ExecutionWindowDecayService
 from src.core.services.resolution import CommitmentResolutionService
 from src.core.services.execution_binding import ExecutionBindingService
+from src.core.services.strategic_interpreter import StrategicFeedbackInterpreter
+from src.core.services.strategy_adaptation import StrategyAdaptationService
+from src.core.interfaces.strategic_memory_store import StrategicMemoryStore
 
 
 @dataclass
@@ -34,6 +40,24 @@ class FeedbackModulation:
     readiness_decay_factor: float = 1.0
     intention_decay_factor: float = 1.0
     pressure_factor: float = 1.0
+
+
+class InMemoryStrategicMemoryStore(StrategicMemoryStore):
+    """
+    Simple in-memory store for C.16.2 demonstration.
+    In production, this would be a DB adapter.
+    """
+
+    def __init__(self):
+        self._store: Dict[str, StrategicMemory] = {}
+
+    def load(self, context: StrategicContext) -> StrategicMemory:
+        key = str(context)
+        return self._store.get(key, StrategicMemory())
+
+    def save(self, context: StrategicContext, memory: StrategicMemory) -> None:
+        key = str(context)
+        self._store[key] = memory
 
 
 class LifeLoop:
@@ -48,6 +72,11 @@ class LifeLoop:
         self.window_decay_service = ExecutionWindowDecayService()
         self.resolution_service = CommitmentResolutionService()
         self.binding_service = ExecutionBindingService()
+        self.strategic_interpreter = StrategicFeedbackInterpreter()
+        self.strategy_adaptation = StrategyAdaptationService()
+
+        # Injected dependency (mock for now)
+        self.strategic_memory_store = InMemoryStrategicMemoryStore()
 
     def _select_mask(self, human: AIHuman) -> Optional[PersonaMask]:
         if not human.personas:
@@ -85,35 +114,58 @@ class LifeLoop:
             signals: LifeSignals,
             now: datetime,
             existing_window: Optional[ExecutionWindow] = None,
-            existing_commitment: Optional[ExecutionCommitment] = None
+            existing_commitment: Optional[ExecutionCommitment] = None,
+            last_executed_intent: Optional[ExecutionIntent] = None
     ) -> InternalContext:
-        # 1. Update State
+
+        # 0. Construct Strategic Context
+        strategic_context = StrategicContext(
+            country="global",
+            region=None,
+            goal_id=None,
+            domain="social_media"
+        )
+
+        # Steps 1 (Update State) ...
+        # (omitted for brevity, same as before)
         human.state.set_resting(signals.rest)
-
         if signals.energy_delta < 0 or signals.attention_delta < 0:
-            human.state.apply_cost(
-                energy_cost=abs(signals.energy_delta),
-                attention_cost=abs(signals.attention_delta)
-            )
+            human.state.apply_cost(abs(signals.energy_delta), abs(signals.attention_delta))
         else:
-            human.state.recover(
-                energy_gain=signals.energy_delta,
-                attention_gain=signals.attention_delta
-            )
-
-        for topic, (pressure, sentiment) in signals.perceived_topics.items():
-            human.stance.update_topic(
-                topic=topic,
-                pressure=pressure,
-                sentiment=sentiment,
-                now=now
-            )
-
+            human.state.recover(signals.energy_delta, signals.attention_delta)
+        for topic, (p, s) in signals.perceived_topics.items():
+            human.stance.update_topic(topic, p, s, now)
         for m in signals.memories:
             human.memory.add_short(m)
 
-        # 2. Calculate Feedback Modulation (Physics)
+        # 2. Calculate Feedback Modulation & Strategic Adaptation
         modulation = self._calculate_feedback_modulation(signals)
+
+        current_memory = self.strategic_memory_store.load(strategic_context)
+
+        if signals.execution_feedback and last_executed_intent:
+            strategic_signals = self.strategic_interpreter.interpret(
+                signals.execution_feedback
+            )
+
+            # Ensure strategy exists
+            from src.core.domain.strategy import StrategicPosture
+            if not hasattr(human, 'strategy'):
+                human.strategy = StrategicPosture(1, [], 0.5, 0.5, 1.0)
+
+            # Adapt Strategy & Memory (Context-Scoped)
+            new_posture, new_memory = self.strategy_adaptation.adapt(
+                human.strategy,
+                current_memory,
+                strategic_signals,
+                last_executed_intent,
+                strategic_context,
+                now
+            )
+
+            human.strategy = new_posture
+            self.strategic_memory_store.save(strategic_context, new_memory)
+            current_memory = new_memory
 
         # 3. Intention Decay & Inertia
         surviving_intentions = []
@@ -181,33 +233,25 @@ class LifeLoop:
                 human.intentions.append(new_intention)
                 human.state.apply_cost(energy_cost=5.0, attention_cost=2.0)
 
-        # 7. Strategic Filtering
+        # 7. Strategic Filtering (Memory-Aware with Cooldown)
         final_intentions = []
 
-        # Creating a default posture for the filter if not present
         from src.core.domain.strategy import StrategicPosture
-        posture = getattr(human, 'strategy', StrategicPosture(
-            horizon_days=1,
-            engagement_policy=[],
-            risk_tolerance=0.5,
-            confidence_baseline=0.5,
-            persistence_factor=1.0
-        ))
+        posture = getattr(human, 'strategy', StrategicPosture(1, [], 0.5, 0.5, 1.0))
 
         for intention in human.intentions:
-            # Updated call signature - removed readiness
             decision = self.strategy_filter.evaluate(
                 intention,
                 posture,
+                current_memory,
+                strategic_context,
                 now
             )
 
             if decision.allow:
                 final_intentions.append(intention)
             elif decision.suppress:
-                # Silently drop
                 pass
-            # Defer branch removed entirely
 
         human.intentions = final_intentions
 
