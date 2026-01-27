@@ -18,6 +18,7 @@ class StrategicReplayEngine:
     """
     Reconstructs strategic state by loading a snapshot and replaying subsequent events.
     Ensures determinism and data integrity via Event Sourcing pattern.
+    Strictly scoped to a single StrategicContext.
     """
 
     def __init__(
@@ -32,7 +33,7 @@ class StrategicReplayEngine:
         self.reducer = CompositeStrategicReducer()
 
     def restore(self, context: StrategicContext) -> StrategicStateBundle:
-        # 1. Load latest snapshot
+        # 1. Load latest snapshot for THIS context
         bundle = self.backend.load(context)
 
         if not bundle:
@@ -44,27 +45,25 @@ class StrategicReplayEngine:
                 version="1.1"
             )
 
-        # 2. Replay events since snapshot
+        # 2. Replay events since snapshot for THIS context
         last_id = bundle.last_event_id
         replay_events = []
 
+        # Fetch history ONLY for this context
+        context_history = self.ledger.get_history(context)
+
         found_snapshot = False
         if last_id is None:
-            # If no ID recorded, replay all events (assuming snapshot is empty/base)
-            replay_events = self.ledger.get_history()
+            replay_events = context_history
         else:
-            # Scan ledger for events occurring AFTER the snapshot's last_event_id
-            for event in self.ledger.get_history():
+            for event in context_history:
                 if found_snapshot:
                     replay_events.append(event)
                 elif event.id == last_id:
                     found_snapshot = True
 
-            # If last_id was not found in ledger, it might be a divergence or truncated log.
-            # For E.4, we assume integrity or warn.
             if not found_snapshot and last_id is not None:
-                # In strict production, this might be an error.
-                # For now, we proceed with empty replay or log warning.
+                # Log warning or handle gap
                 pass
 
         # 3. Apply Reducers
@@ -73,6 +72,7 @@ class StrategicReplayEngine:
             try:
                 current_bundle = self.reducer.reduce(current_bundle, event)
             except Exception as e:
-                raise ReplayIntegrityError(f"Failed to replay event {event.id} ({event.event_type}): {e}")
+                raise ReplayIntegrityError(
+                    f"Failed to replay event {event.id} ({event.event_type}) for context {context}: {e}")
 
         return current_bundle
