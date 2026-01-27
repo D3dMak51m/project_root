@@ -2,6 +2,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
 from uuid import uuid4
 
+from core.services.strategic_priority import StrategicPriorityService
 from src.core.domain.entity import AIHuman
 from src.core.domain.strategic_context import StrategicContext
 from src.core.domain.execution_intent import ExecutionIntent
@@ -31,7 +32,8 @@ class StrategicOrchestrator:
             backend: StrategicStateBackend,
             routing_policy: Optional[ContextRoutingPolicy] = None,
             arbitrator: Optional[StrategicArbitrator] = None,
-            resource_manager: Optional[StrategicResourceManager] = None
+            resource_manager: Optional[StrategicResourceManager] = None,
+            priority_service: Optional[StrategicPriorityService] = None
     ):
         self.time_source = time_source
         self.ledger = ledger
@@ -39,11 +41,11 @@ class StrategicOrchestrator:
         self.routing_policy = routing_policy or DefaultRoutingPolicy()
         self.arbitrator = arbitrator or PriorityArbitrator()
         self.resource_manager = resource_manager or StrategicResourceManager()
+        self.priority_service = priority_service or StrategicPriorityService()
 
         self._runtimes: Dict[str, StrategicContextRuntime] = {}
         self._last_executed_intent: Optional[ExecutionIntent] = None
 
-        # Initialize Global Budget
         self._budget = StrategicResourceBudget(
             energy_budget=100.0,
             attention_budget=100.0,
@@ -52,23 +54,16 @@ class StrategicOrchestrator:
         )
 
     def register_context(self, context: StrategicContext, human: AIHuman) -> None:
-        """
-        Registers a new strategic context and initializes its runtime.
-        Performs cold-start restore from backend.
-        """
         key = str(context)
         if key in self._runtimes:
             return
 
-        # Create isolated LifeLoop for this context
         lifeloop = LifeLoop(
             time_source=self.time_source,
             ledger=self.ledger,
             state_backend=self.backend
-            # Observer and policy can be injected if needed
         )
 
-        # Restore state (Bootstrap)
         lifeloop.restore(human, context)
 
         runtime = StrategicContextRuntime(
@@ -92,9 +87,11 @@ class StrategicOrchestrator:
         3. Tick relevant LifeLoops
         4. Collect intents
         5. Filter Feasible Intents (Budget Check)
-        6. Arbitrate
-        7. Reserve Budget
-        8. Suppress losers
+        6. Compute Priorities [NEW]
+        7. Arbitrate
+        8. Reserve Budget
+        9. Update Starvation [NEW]
+        10. Suppress losers
         """
         now = self.time_source.now()
 
@@ -105,7 +102,10 @@ class StrategicOrchestrator:
         available_contexts = [r.context for r in self._runtimes.values() if r.active]
         target_contexts = self.routing_policy.resolve(signals, available_contexts)
 
-        candidates: List[Tuple[StrategicContextRuntime, ExecutionIntent]] = []
+        # List of (Runtime, Intent)
+        raw_candidates: List[Tuple[StrategicContextRuntime, ExecutionIntent]] = []
+        # Track which runtimes produced an intent for starvation logic
+        runtimes_with_intent = set()
 
         # 3. Tick LifeLoops
         for context in target_contexts:
@@ -126,42 +126,66 @@ class StrategicOrchestrator:
 
             # 4. Collect Intents
             if internal_context.execution_intent:
-                # Intents without cost are invalid and will be filtered out by resource manager
-                candidates.append((runtime, internal_context.execution_intent))
+                intent = internal_context.execution_intent
+                # Ensure cost exists (E.7 fix assumption: binding sets it)
+                if not intent.estimated_cost:
+                    # Fallback or skip? E.7 said strict reject.
+                    # We skip if no cost.
+                    pass
+                else:
+                    raw_candidates.append((runtime, intent))
+                    runtimes_with_intent.add(key)
 
-        # 5. Filter Feasible Intents (Budget Check)
-        feasible_candidates = []
-        for runtime, intent in candidates:
+        # 5. Filter Feasible Intents & 6. Compute Priorities
+        # List of (Runtime, Intent, PriorityScore)
+        arbitration_candidates: List[Tuple[StrategicContextRuntime, ExecutionIntent, float]] = []
+
+        for runtime, intent in raw_candidates:
             allocation = self.resource_manager.evaluate(intent, self._budget)
             if allocation.approved:
-                feasible_candidates.append((runtime, intent))
+                priority = self.priority_service.compute_priority(intent, runtime)
+                arbitration_candidates.append((runtime, intent, priority))
             else:
                 # Suppress immediately if not feasible
                 runtime.lifeloop.suppress_pending_intentions(human)
 
-        # 6. Arbitrate
+        # 7. Arbitrate
         winner_intent: Optional[ExecutionIntent] = None
         winner_runtime: Optional[StrategicContextRuntime] = None
 
-        if feasible_candidates:
-            winner = self.arbitrator.select(feasible_candidates)
+        if arbitration_candidates:
+            winner = self.arbitrator.select(arbitration_candidates)
             if winner:
                 winner_runtime, winner_intent = winner
 
-                # 7. Reserve Budget
-                # Strict reservation: Must have cost.
-                # If cost is missing (should be caught by evaluate, but double check), fail safe.
+                # 8. Reserve Budget
                 if winner_intent.estimated_cost:
                     self._budget = self.resource_manager.reserve(self._budget, winner_intent.estimated_cost)
                     self._last_executed_intent = winner_intent
                 else:
-                    # Should be unreachable due to evaluate check, but safe fallback
+                    # Should be unreachable
                     winner_intent = None
                     winner_runtime = None
 
-        # 8. Suppress Losers
-        for runtime, intent in feasible_candidates:
-            if runtime != winner_runtime:
+        # 9. Update Starvation & 10. Suppress Losers
+        # Iterate over ALL active runtimes to update starvation
+        for key, runtime in self._runtimes.items():
+            if not runtime.active:
+                continue
+
+            is_winner = (runtime == winner_runtime)
+            has_intent = (key in runtimes_with_intent)
+
+            # Update starvation score
+            runtime.starvation_score = self.priority_service.update_starvation(
+                runtime, is_winner, has_intent
+            )
+
+            if is_winner:
+                runtime.last_win_tick = runtime.tick_count
+
+            # Suppress if had intent but didn't win (either infeasible or lost arbitration)
+            if has_intent and not is_winner:
                 runtime.lifeloop.suppress_pending_intentions(human)
 
         return winner_intent
