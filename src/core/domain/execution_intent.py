@@ -1,7 +1,9 @@
 from dataclasses import dataclass
 from uuid import UUID
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+from src.core.domain.resource import ResourceCost
+
 
 @dataclass(frozen=True)
 class ExecutionIntent:
@@ -19,3 +21,6 @@ class ExecutionIntent:
     created_at: datetime
     reversible: bool
     risk_level: float
+
+    # [NEW] Estimated cost for budgeting
+    estimated_cost: Optional[ResourceCost] = None

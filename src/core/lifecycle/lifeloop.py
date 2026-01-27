@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 import random
 from typing import Optional, Dict, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 
 from core.interfaces.strategic_memory_store import StrategicMemoryStore
 from core.interfaces.strategic_trajectory_memory_store import StrategicTrajectoryMemoryStore
@@ -19,7 +19,7 @@ from src.core.domain.execution_result import ExecutionStatus, ExecutionFailureTy
 from src.core.domain.strategic_signals import StrategicSignals
 from src.core.domain.strategic_context import StrategicContext
 from src.core.domain.strategic_memory import StrategicMemory
-from src.core.domain.strategic_trajectory import StrategicTrajectoryMemory, TrajectoryStatus
+from src.core.domain.strategic_trajectory import StrategicTrajectoryMemory, TrajectoryStatus, StrategicTrajectory
 from src.core.domain.strategic_snapshot import StrategicSnapshot
 from src.core.domain.strategy import StrategicPosture, StrategicMode
 from src.core.lifecycle.signals import LifeSignals
@@ -53,7 +53,7 @@ from src.core.persistence.in_memory_backend import InMemoryStrategicStateBackend
 from src.core.persistence.strategic_state_bundle import StrategicStateBundle
 from src.core.persistence.snapshot_policy import SnapshotPolicy, DefaultSnapshotPolicy
 from src.core.replay.strategic_replay_engine import StrategicReplayEngine
-from dataclasses import asdict
+
 
 @dataclass
 class FeedbackModulation:
@@ -129,7 +129,7 @@ class LifeLoop:
         self.strategic_trajectory_memory_store = InMemoryStrategicTrajectoryMemoryStore()
 
         self._current_window: Optional[ExecutionWindow] = None
-        self._tick_count = 0
+        # REMOVED: self._tick_counts
 
     def restore(self, human: AIHuman, context: StrategicContext) -> None:
         bundle = self.replay_engine.restore(context)
@@ -137,18 +137,29 @@ class LifeLoop:
         self.strategic_memory_store.save(context, bundle.memory)
         self.strategic_trajectory_memory_store.save(context, bundle.trajectory_memory)
 
-    def _emit_event(self, event_type: str, details: Dict[str, Any], context_domain: str,
+    def _emit_event(self, event_type: str, details: Dict[str, Any], context: StrategicContext,
                     now: datetime) -> StrategicEvent:
         event = StrategicEvent(
             id=uuid4(),
             timestamp=now,
             event_type=event_type,
             details=details,
-            context_domain=context_domain
+            context=context
         )
         self.ledger.record(event)
         self.observer.on_event(event)
         return event
+
+    def _serialize_for_event(self, obj: Any) -> Any:
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        if isinstance(obj, (StrategicMode, TrajectoryStatus)):
+            return obj.value
+        if hasattr(obj, "__dataclass_fields__"):
+            return {k: self._serialize_for_event(v) for k, v in asdict(obj).items()}
+        if isinstance(obj, list):
+            return [self._serialize_for_event(i) for i in obj]
+        return obj
 
     def _persist_state(
             self,
@@ -172,8 +183,6 @@ class LifeLoop:
     def get_strategic_snapshot(self, human: AIHuman, context: StrategicContext) -> StrategicSnapshot:
         traj_mem = self.strategic_trajectory_memory_store.load(context)
         mem = self.strategic_memory_store.load(context)
-
-        from src.core.domain.strategic_trajectory import TrajectoryStatus
 
         active = [t for t in traj_mem.trajectories.values() if t.status == TrajectoryStatus.ACTIVE]
         stalled = [t for t in traj_mem.trajectories.values() if t.status == TrajectoryStatus.STALLED]
@@ -223,58 +232,28 @@ class LifeLoop:
             mod.intention_decay_factor = 1.5
         return mod
 
-    def _serialize_for_event(self, obj: Any) -> Any:
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-        if isinstance(obj, (StrategicMode, TrajectoryStatus)):
-            return obj.value
-        if hasattr(obj, "__dataclass_fields__"):
-            return {k: self._serialize_for_event(v) for k, v in asdict(obj).items()}
-        if isinstance(obj, list):
-            return [self._serialize_for_event(i) for i in obj]
-        return obj
-
     def tick(
             self,
             human: AIHuman,
             signals: LifeSignals,
+            strategic_context: StrategicContext,
+            tick_count: int,
             existing_window: Optional[ExecutionWindow] = None,
             existing_commitment: Optional[ExecutionCommitment] = None,
             last_executed_intent: Optional[ExecutionIntent] = None
     ) -> InternalContext:
 
         now = self.time_source.now()
-        self._tick_count += 1
-
-        strategic_context = StrategicContext(
-            country="global",
-            region=None,
-            goal_id=None,
-            domain="social_media"
-        )
 
         # 1. Update State
         human.state.set_resting(signals.rest)
 
         if signals.energy_delta < 0 or signals.attention_delta < 0:
-            human.state.apply_cost(
-                energy_cost=abs(signals.energy_delta),
-                attention_cost=abs(signals.attention_delta)
-            )
+            human.state.apply_cost(abs(signals.energy_delta), abs(signals.attention_delta))
         else:
-            human.state.recover(
-                energy_gain=signals.energy_delta,
-                attention_gain=signals.attention_delta
-            )
-
-        for topic, (pressure, sentiment) in signals.perceived_topics.items():
-            human.stance.update_topic(
-                topic=topic,
-                pressure=pressure,
-                sentiment=sentiment,
-                now=now
-            )
-
+            human.state.recover(signals.energy_delta, signals.attention_delta)
+        for topic, (p, s) in signals.perceived_topics.items():
+            human.stance.update_topic(topic, p, s, now)
         for m in signals.memories:
             human.memory.add_short(m)
 
@@ -308,13 +287,11 @@ class LifeLoop:
                 last_event = self._emit_event(
                     "STRATEGY_ADAPTATION",
                     {"posture_after": self._serialize_for_event(new_posture)},
-                    strategic_context.domain,
+                    strategic_context,
                     now
                 )
 
             # Check for memory changes (Path Abandonment)
-            # We need to detect which path changed.
-            # For C.16.1 logic, only one path changes per adapt call.
             path_key = extract_path_key(last_executed_intent, strategic_context)
             old_status = current_memory.get_status(path_key)
             new_status = new_memory.get_status(path_key)
@@ -326,7 +303,7 @@ class LifeLoop:
                         "path_key": list(path_key),
                         "path_status_after": self._serialize_for_event(new_status)
                     },
-                    strategic_context.domain,
+                    strategic_context,
                     now
                 )
 
@@ -350,7 +327,7 @@ class LifeLoop:
                             "trajectory_id": t_id,
                             "trajectory_after": self._serialize_for_event(t_new)
                         },
-                        strategic_context.domain,
+                        strategic_context,
                         now
                     )
 
@@ -365,7 +342,7 @@ class LifeLoop:
 
             for r in reflections:
                 last_event = self._emit_event("REFLECTION", {"trajectory": r.trajectory_id, "outcome": r.outcome.value},
-                                              strategic_context.domain, now)
+                                              strategic_context, now)
 
             # D. Trajectory Rebinding
             final_trajectory_memory, rebindings = self.trajectory_rebinding_service.rebind(
@@ -376,7 +353,6 @@ class LifeLoop:
             )
 
             for rb in rebindings:
-                # Get updated trajectories
                 source_after = final_trajectory_memory.get_trajectory(rb.source_trajectory_id)
                 target_after = final_trajectory_memory.get_trajectory(rb.target_trajectory_id)
 
@@ -386,7 +362,7 @@ class LifeLoop:
                         "source_trajectory_after": self._serialize_for_event(source_after),
                         "target_trajectory_after": self._serialize_for_event(target_after)
                     },
-                    strategic_context.domain,
+                    strategic_context,
                     now
                 )
 
@@ -401,7 +377,7 @@ class LifeLoop:
                 last_event = self._emit_event(
                     "HORIZON_SHIFT",
                     {"posture_after": self._serialize_for_event(final_posture)},
-                    strategic_context.domain,
+                    strategic_context,
                     now
                 )
 
@@ -413,7 +389,7 @@ class LifeLoop:
             current_trajectory_memory = final_trajectory_memory
 
         # Persistence Check
-        if self.snapshot_policy.should_save(strategic_context, self._tick_count, last_event, human.strategy):
+        if self.snapshot_policy.should_save(strategic_context, tick_count, last_event, human.strategy):
             self._persist_state(strategic_context, human.strategy, current_memory, current_trajectory_memory,
                                 last_event)
 
@@ -496,8 +472,7 @@ class LifeLoop:
                 resolution_result = self.resolution_service.resolve(active_window, human.state, human.readiness, now)
                 if resolution_result.commitment:
                     active_commitment = resolution_result.commitment
-                    self._emit_event("COMMITMENT_FORMED", {"id": str(active_commitment.id)}, strategic_context.domain,
-                                     now)
+                    self._emit_event("COMMITMENT_FORMED", {"id": str(active_commitment.id)}, strategic_context, now)
                 if resolution_result.window_consumed: active_window = None
 
         # 9. Execution Binding
@@ -517,3 +492,11 @@ class LifeLoop:
         )
 
         return context
+
+    def suppress_pending_intentions(self, human: AIHuman) -> None:
+        """
+        Soft suppression of pending intentions/commitments for non-selected contexts.
+        Called by Orchestrator after arbitration.
+        """
+        if human.readiness.value > 0:
+            human.readiness.decay(5.0)
