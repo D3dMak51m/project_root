@@ -1,9 +1,11 @@
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import uuid4
 import random
 from typing import Optional, Dict, Any
+from dataclasses import dataclass
 
+from core.interfaces.strategic_memory_store import StrategicMemoryStore
+from core.interfaces.strategic_trajectory_memory_store import StrategicTrajectoryMemoryStore
 from src.core.domain.entity import AIHuman
 from src.core.domain.intention import Intention, DeferredAction
 from src.core.domain.persona import PersonaMask
@@ -49,6 +51,8 @@ from src.core.observability.null_observer import NullStrategicObserver
 from src.core.persistence.strategic_state_backend import StrategicStateBackend
 from src.core.persistence.in_memory_backend import InMemoryStrategicStateBackend
 from src.core.persistence.strategic_state_bundle import StrategicStateBundle
+from src.core.persistence.snapshot_policy import SnapshotPolicy, DefaultSnapshotPolicy
+from src.core.replay.strategic_replay_engine import StrategicReplayEngine
 
 
 @dataclass
@@ -59,18 +63,50 @@ class FeedbackModulation:
     pressure_factor: float = 1.0
 
 
+class InMemoryStrategicMemoryStore(StrategicMemoryStore):
+    def __init__(self):
+        self._store: Dict[str, StrategicMemory] = {}
+
+    def load(self, context: StrategicContext) -> StrategicMemory:
+        key = str(context)
+        return self._store.get(key, StrategicMemory())
+
+    def save(self, context: StrategicContext, memory: StrategicMemory) -> None:
+        key = str(context)
+        self._store[key] = memory
+
+
+class InMemoryStrategicTrajectoryMemoryStore(StrategicTrajectoryMemoryStore):
+    def __init__(self):
+        self._store: Dict[str, StrategicTrajectoryMemory] = {}
+
+    def load(self, context: StrategicContext) -> StrategicTrajectoryMemory:
+        key = str(context)
+        return self._store.get(key, StrategicTrajectoryMemory())
+
+    def save(self, context: StrategicContext, memory: StrategicTrajectoryMemory) -> None:
+        key = str(context)
+        self._store[key] = memory
+
+
 class LifeLoop:
     def __init__(
             self,
             time_source: Optional[TimeSource] = None,
             ledger: Optional[StrategicLedger] = None,
             observer: Optional[StrategicObserver] = None,
-            state_backend: Optional[StrategicStateBackend] = None  # [NEW]
+            state_backend: Optional[StrategicStateBackend] = None,
+            snapshot_policy: Optional[SnapshotPolicy] = None
     ):
         self.time_source = time_source or SystemTimeSource()
         self.ledger = ledger or InMemoryStrategicLedger()
         self.observer = observer or NullStrategicObserver()
-        self.state_backend = state_backend or InMemoryStrategicStateBackend()  # [NEW]
+        self.state_backend = state_backend or InMemoryStrategicStateBackend()
+        self.snapshot_policy = snapshot_policy or DefaultSnapshotPolicy()
+
+        self.replay_engine = StrategicReplayEngine(
+            self.state_backend, self.ledger, self.time_source
+        )
 
         self.impulse_generator = ImpulseGenerator()
         self.intention_gate = IntentionGate()
@@ -89,7 +125,73 @@ class LifeLoop:
         self.strategic_reflection_service = StrategicReflectionService()
         self.trajectory_rebinding_service = TrajectoryRebindingService()
 
+        self.strategic_memory_store = InMemoryStrategicMemoryStore()
+        self.strategic_trajectory_memory_store = InMemoryStrategicTrajectoryMemoryStore()
+
         self._current_window: Optional[ExecutionWindow] = None
+        self._tick_count = 0
+
+    def restore(self, human: AIHuman, context: StrategicContext) -> None:
+        bundle = self.replay_engine.restore(context)
+        human.strategy = bundle.posture
+        self.strategic_memory_store.save(context, bundle.memory)
+        self.strategic_trajectory_memory_store.save(context, bundle.trajectory_memory)
+
+    def _emit_event(self, event_type: str, details: Dict[str, Any], context_domain: str,
+                    now: datetime) -> StrategicEvent:
+        event = StrategicEvent(
+            id=uuid4(),
+            timestamp=now,
+            event_type=event_type,
+            details=details,
+            context_domain=context_domain
+        )
+        self.ledger.record(event)
+        self.observer.on_event(event)
+        return event
+
+    def _persist_state(
+            self,
+            context: StrategicContext,
+            posture: StrategicPosture,
+            memory: StrategicMemory,
+            trajectory_memory: StrategicTrajectoryMemory,
+            last_event: Optional[StrategicEvent],
+            snapshot: Optional[StrategicSnapshot] = None
+    ):
+        bundle = StrategicStateBundle(
+            posture=posture,
+            memory=memory,
+            trajectory_memory=trajectory_memory,
+            last_snapshot=snapshot,
+            last_event_id=last_event.id if last_event else None,
+            version="1.1"
+        )
+        self.state_backend.save(context, bundle)
+
+    def get_strategic_snapshot(self, human: AIHuman, context: StrategicContext) -> StrategicSnapshot:
+        traj_mem = self.strategic_trajectory_memory_store.load(context)
+        mem = self.strategic_memory_store.load(context)
+
+        from src.core.domain.strategic_trajectory import TrajectoryStatus
+
+        active = [t for t in traj_mem.trajectories.values() if t.status == TrajectoryStatus.ACTIVE]
+        stalled = [t for t in traj_mem.trajectories.values() if t.status == TrajectoryStatus.STALLED]
+        abandoned = [t for t in traj_mem.trajectories.values() if t.status == TrajectoryStatus.ABANDONED]
+
+        path_statuses = {str(k): v for k, v in mem.paths.items()}
+
+        return StrategicSnapshot(
+            mode=human.strategy.mode,
+            horizon_days=human.strategy.horizon_days,
+            confidence=human.strategy.confidence_baseline,
+            risk_tolerance=human.strategy.risk_tolerance,
+            persistence_factor=human.strategy.persistence_factor,
+            active_trajectories=active,
+            stalled_trajectories=stalled,
+            abandoned_trajectories=abandoned,
+            path_statuses=path_statuses
+        )
 
     def _select_mask(self, human: AIHuman) -> Optional[PersonaMask]:
         if not human.personas:
@@ -121,75 +223,6 @@ class LifeLoop:
             mod.intention_decay_factor = 1.5
         return mod
 
-    def _emit_event(self, event_type: str, details: Dict[str, Any], context_domain: str, now: datetime):
-        event = StrategicEvent(
-            id=uuid4(),
-            timestamp=now,
-            event_type=event_type,
-            details=details,
-            context_domain=context_domain
-        )
-        self.ledger.record(event)
-        self.observer.on_event(event)
-
-    def _load_or_initialize_state(self, human: AIHuman, context: StrategicContext) -> tuple[
-        StrategicPosture, StrategicMemory, StrategicTrajectoryMemory]:
-        """
-        Loads state from backend or initializes defaults if cold start.
-        """
-        bundle = self.state_backend.load(context)
-
-        if bundle:
-            return bundle.posture, bundle.memory, bundle.trajectory_memory
-
-        # Cold start defaults
-        # If human has strategy set (e.g. from init), use it, else default
-        posture = getattr(human, 'strategy', StrategicPosture([], 0.5, 0.5, 1.0, StrategicMode.BALANCED))
-        memory = StrategicMemory()
-        trajectory_memory = StrategicTrajectoryMemory()
-
-        return posture, memory, trajectory_memory
-
-    def _persist_state(
-            self,
-            context: StrategicContext,
-            posture: StrategicPosture,
-            memory: StrategicMemory,
-            trajectory_memory: StrategicTrajectoryMemory,
-            snapshot: Optional[StrategicSnapshot] = None
-    ):
-        bundle = StrategicStateBundle(
-            posture=posture,
-            memory=memory,
-            trajectory_memory=trajectory_memory,
-            last_snapshot=snapshot
-        )
-        self.state_backend.save(context, bundle)
-
-    def get_strategic_snapshot(self, human: AIHuman, context: StrategicContext) -> StrategicSnapshot:
-        # Load state to generate snapshot
-        posture, mem, traj_mem = self._load_or_initialize_state(human, context)
-
-        from src.core.domain.strategic_trajectory import TrajectoryStatus
-
-        active = [t for t in traj_mem.trajectories.values() if t.status == TrajectoryStatus.ACTIVE]
-        stalled = [t for t in traj_mem.trajectories.values() if t.status == TrajectoryStatus.STALLED]
-        abandoned = [t for t in traj_mem.trajectories.values() if t.status == TrajectoryStatus.ABANDONED]
-
-        path_statuses = {str(k): v for k, v in mem.paths.items()}
-
-        return StrategicSnapshot(
-            mode=posture.mode,
-            horizon_days=posture.horizon_days,
-            confidence=posture.confidence_baseline,
-            risk_tolerance=posture.risk_tolerance,
-            persistence_factor=posture.persistence_factor,
-            active_trajectories=active,
-            stalled_trajectories=stalled,
-            abandoned_trajectories=abandoned,
-            path_statuses=path_statuses
-        )
-
     def tick(
             self,
             human: AIHuman,
@@ -200,6 +233,7 @@ class LifeLoop:
     ) -> InternalContext:
 
         now = self.time_source.now()
+        self._tick_count += 1
 
         strategic_context = StrategicContext(
             country="global",
@@ -207,13 +241,6 @@ class LifeLoop:
             goal_id=None,
             domain="social_media"
         )
-
-        # Load Strategic State [NEW]
-        current_posture, current_memory, current_trajectory_memory = self._load_or_initialize_state(human,
-                                                                                                    strategic_context)
-
-        # Ensure human has current strategy reference (for read-only access elsewhere if needed)
-        human.strategy = current_posture
 
         # 1. Update State
         human.state.set_resting(signals.rest)
@@ -243,14 +270,22 @@ class LifeLoop:
         # 2. Calculate Feedback Modulation & Strategic Adaptation
         modulation = self._calculate_feedback_modulation(signals)
 
+        current_memory = self.strategic_memory_store.load(strategic_context)
+        current_trajectory_memory = self.strategic_trajectory_memory_store.load(strategic_context)
+
+        last_event: Optional[StrategicEvent] = None
+
         if signals.execution_feedback and last_executed_intent:
             strategic_signals = self.strategic_interpreter.interpret(
                 signals.execution_feedback
             )
 
+            if not hasattr(human, 'strategy'):
+                human.strategy = StrategicPosture([], 0.5, 0.5, 1.0, StrategicMode.BALANCED)
+
             # A. Adapt Strategy & Memory
             new_posture, new_memory = self.strategy_adaptation.adapt(
-                current_posture,
+                human.strategy,
                 current_memory,
                 strategic_signals,
                 last_executed_intent,
@@ -258,10 +293,10 @@ class LifeLoop:
                 now
             )
 
-            if new_posture != current_posture:
-                self._emit_event("STRATEGY_ADAPTATION",
-                                 {"old_mode": current_posture.mode.value, "new_mode": new_posture.mode.value},
-                                 strategic_context.domain, now)
+            if new_posture != human.strategy:
+                last_event = self._emit_event("STRATEGY_ADAPTATION", {"old_mode": human.strategy.mode.value,
+                                                                      "new_mode": new_posture.mode.value},
+                                              strategic_context.domain, now)
 
             # B. Update Trajectories
             new_trajectory_memory = self.strategic_trajectory_service.update(
@@ -283,8 +318,8 @@ class LifeLoop:
             )
 
             for r in reflections:
-                self._emit_event("REFLECTION", {"trajectory": r.trajectory_id, "outcome": r.outcome.value},
-                                 strategic_context.domain, now)
+                last_event = self._emit_event("REFLECTION", {"trajectory": r.trajectory_id, "outcome": r.outcome.value},
+                                              strategic_context.domain, now)
 
             # D. Trajectory Rebinding
             final_trajectory_memory, rebindings = self.trajectory_rebinding_service.rebind(
@@ -295,8 +330,9 @@ class LifeLoop:
             )
 
             for rb in rebindings:
-                self._emit_event("REBINDING", {"source": rb.source_trajectory_id, "target": rb.target_trajectory_id},
-                                 strategic_context.domain, now)
+                last_event = self._emit_event("REBINDING",
+                                              {"source": rb.source_trajectory_id, "target": rb.target_trajectory_id},
+                                              strategic_context.domain, now)
 
             # E. Horizon Shift
             final_posture = self.horizon_shift_service.evaluate(
@@ -306,20 +342,21 @@ class LifeLoop:
             )
 
             if final_posture.mode != new_posture.mode:
-                self._emit_event("HORIZON_SHIFT", {"from": new_posture.mode.value, "to": final_posture.mode.value},
-                                 strategic_context.domain, now)
+                last_event = self._emit_event("HORIZON_SHIFT",
+                                              {"from": new_posture.mode.value, "to": final_posture.mode.value},
+                                              strategic_context.domain, now)
 
-            # Update local references
-            current_posture = final_posture
+            human.strategy = final_posture
+            self.strategic_memory_store.save(strategic_context, new_memory)
+            self.strategic_trajectory_memory_store.save(strategic_context, final_trajectory_memory)
+
             current_memory = new_memory
             current_trajectory_memory = final_trajectory_memory
-            human.strategy = final_posture
 
-        # Persist State [NEW]
-        # We persist every tick where strategy might change or just periodically.
-        # For safety in E.2, we persist if feedback was processed or just always (simple).
-        # Optimally: only if changed. But here we save always to ensure consistency.
-        self._persist_state(strategic_context, current_posture, current_memory, current_trajectory_memory)
+        # Persistence Check
+        if self.snapshot_policy.should_save(strategic_context, self._tick_count, last_event, human.strategy):
+            self._persist_state(strategic_context, human.strategy, current_memory, current_trajectory_memory,
+                                last_event)
 
         # 3. Intention Decay
         surviving_intentions = []
@@ -363,8 +400,9 @@ class LifeLoop:
 
         # 7. Strategic Filtering
         final_intentions = []
+        if not hasattr(human, 'strategy'): human.strategy = StrategicPosture([], 0.5, 0.5, 1.0, StrategicMode.BALANCED)
         for intention in human.intentions:
-            decision = self.strategy_filter.evaluate(intention, current_posture, current_memory,
+            decision = self.strategy_filter.evaluate(intention, human.strategy, current_memory,
                                                      current_trajectory_memory, strategic_context, now)
             if decision.allow: final_intentions.append(intention)
         human.intentions = final_intentions

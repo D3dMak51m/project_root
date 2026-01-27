@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Optional
+from uuid import UUID
 from src.core.domain.strategy import StrategicPosture
 from src.core.domain.strategic_memory import StrategicMemory
 from src.core.domain.strategic_trajectory import StrategicTrajectoryMemory
@@ -16,4 +17,5 @@ class StrategicStateBundle:
     memory: StrategicMemory
     trajectory_memory: StrategicTrajectoryMemory
     last_snapshot: Optional[StrategicSnapshot] = None
-    version: str = "1.0"
+    last_event_id: Optional[UUID] = None
+    version: str = "1.1"

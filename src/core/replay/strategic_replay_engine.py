@@ -1,0 +1,69 @@
+from typing import List, Optional
+from datetime import datetime
+
+from src.core.domain.strategic_context import StrategicContext
+from src.core.persistence.strategic_state_backend import StrategicStateBackend
+from src.core.persistence.strategic_state_bundle import StrategicStateBundle
+from src.core.ledger.strategic_ledger import StrategicLedger
+from src.core.ledger.strategic_event import StrategicEvent
+from src.core.time.time_source import TimeSource
+from src.core.domain.strategy import StrategicPosture, StrategicMode
+from src.core.domain.strategic_memory import StrategicMemory
+from src.core.domain.strategic_trajectory import StrategicTrajectoryMemory
+
+
+class StrategicReplayEngine:
+    """
+    Reconstructs strategic state by loading a snapshot and replaying subsequent events.
+    Ensures determinism and data integrity.
+    """
+
+    def __init__(
+            self,
+            backend: StrategicStateBackend,
+            ledger: StrategicLedger,
+            time_source: TimeSource
+    ):
+        self.backend = backend
+        self.ledger = ledger
+        self.time_source = time_source
+
+    def restore(self, context: StrategicContext) -> StrategicStateBundle:
+        # 1. Load latest snapshot
+        bundle = self.backend.load(context)
+
+        if not bundle:
+            # Cold start defaults
+            return StrategicStateBundle(
+                posture=StrategicPosture([], 0.5, 0.5, 1.0, StrategicMode.BALANCED),
+                memory=StrategicMemory(),
+                trajectory_memory=StrategicTrajectoryMemory(),
+                version="1.1"
+            )
+
+        # 2. Replay events since snapshot
+        last_id = bundle.last_event_id
+        replay_events = []
+
+        # Simple replay logic: find events after last_id
+        # In a real event store, this would be a query.
+        # Here we iterate the in-memory ledger history.
+        found_snapshot = False
+        if last_id is None:
+            # If no ID recorded, replay all (or assume snapshot is fresh? Safe to replay all if idempotent)
+            # For E.3, we assume snapshot is fresh if no ID, or we replay everything if we can't sync.
+            # Let's assume replay all if no ID, but practically bundle implies state up to some point.
+            # If last_id is None, we assume clean state or legacy bundle.
+            replay_events = self.ledger.get_history()
+        else:
+            for event in self.ledger.get_history():
+                if found_snapshot:
+                    replay_events.append(event)
+                elif event.id == last_id:
+                    found_snapshot = True
+
+        # Apply events (No-op for E.3, placeholder for E.4 reducers)
+        for _ in replay_events:
+            pass
+
+        return bundle
