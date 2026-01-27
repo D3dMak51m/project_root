@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Any
 from datetime import datetime
 
 @dataclass(frozen=True)
@@ -8,8 +8,17 @@ class PathStatus:
     last_outcome: str
     abandonment_level: str  # "none", "soft", "hard"
     last_updated: datetime
-    # [NEW] Cooldown expiration time for soft abandonment
     cooldown_until: Optional[datetime] = None
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'PathStatus':
+        return cls(
+            failure_count=data['failure_count'],
+            last_outcome=data['last_outcome'],
+            abandonment_level=data['abandonment_level'],
+            last_updated=datetime.fromisoformat(data['last_updated']),
+            cooldown_until=datetime.fromisoformat(data['cooldown_until']) if data.get('cooldown_until') else None
+        )
 
 @dataclass(frozen=True)
 class StrategicMemory:

@@ -19,7 +19,7 @@ from src.core.domain.execution_result import ExecutionStatus, ExecutionFailureTy
 from src.core.domain.strategic_signals import StrategicSignals
 from src.core.domain.strategic_context import StrategicContext
 from src.core.domain.strategic_memory import StrategicMemory
-from src.core.domain.strategic_trajectory import StrategicTrajectoryMemory
+from src.core.domain.strategic_trajectory import StrategicTrajectoryMemory, TrajectoryStatus
 from src.core.domain.strategic_snapshot import StrategicSnapshot
 from src.core.domain.strategy import StrategicPosture, StrategicMode
 from src.core.lifecycle.signals import LifeSignals
@@ -53,7 +53,7 @@ from src.core.persistence.in_memory_backend import InMemoryStrategicStateBackend
 from src.core.persistence.strategic_state_bundle import StrategicStateBundle
 from src.core.persistence.snapshot_policy import SnapshotPolicy, DefaultSnapshotPolicy
 from src.core.replay.strategic_replay_engine import StrategicReplayEngine
-
+from dataclasses import asdict
 
 @dataclass
 class FeedbackModulation:
@@ -223,6 +223,17 @@ class LifeLoop:
             mod.intention_decay_factor = 1.5
         return mod
 
+    def _serialize_for_event(self, obj: Any) -> Any:
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        if isinstance(obj, (StrategicMode, TrajectoryStatus)):
+            return obj.value
+        if hasattr(obj, "__dataclass_fields__"):
+            return {k: self._serialize_for_event(v) for k, v in asdict(obj).items()}
+        if isinstance(obj, list):
+            return [self._serialize_for_event(i) for i in obj]
+        return obj
+
     def tick(
             self,
             human: AIHuman,
@@ -294,9 +305,30 @@ class LifeLoop:
             )
 
             if new_posture != human.strategy:
-                last_event = self._emit_event("STRATEGY_ADAPTATION", {"old_mode": human.strategy.mode.value,
-                                                                      "new_mode": new_posture.mode.value},
-                                              strategic_context.domain, now)
+                last_event = self._emit_event(
+                    "STRATEGY_ADAPTATION",
+                    {"posture_after": self._serialize_for_event(new_posture)},
+                    strategic_context.domain,
+                    now
+                )
+
+            # Check for memory changes (Path Abandonment)
+            # We need to detect which path changed.
+            # For C.16.1 logic, only one path changes per adapt call.
+            path_key = extract_path_key(last_executed_intent, strategic_context)
+            old_status = current_memory.get_status(path_key)
+            new_status = new_memory.get_status(path_key)
+
+            if old_status != new_status:
+                last_event = self._emit_event(
+                    "PATH_ABANDONMENT",
+                    {
+                        "path_key": list(path_key),
+                        "path_status_after": self._serialize_for_event(new_status)
+                    },
+                    strategic_context.domain,
+                    now
+                )
 
             # B. Update Trajectories
             new_trajectory_memory = self.strategic_trajectory_service.update(
@@ -307,6 +339,20 @@ class LifeLoop:
                 new_posture,
                 now
             )
+
+            # Detect trajectory changes
+            for t_id, t_new in new_trajectory_memory.trajectories.items():
+                t_old = current_trajectory_memory.get_trajectory(t_id)
+                if t_old != t_new:
+                    last_event = self._emit_event(
+                        "TRAJECTORY_UPDATE",
+                        {
+                            "trajectory_id": t_id,
+                            "trajectory_after": self._serialize_for_event(t_new)
+                        },
+                        strategic_context.domain,
+                        now
+                    )
 
             # C. Strategic Reflection
             reflections = self.strategic_reflection_service.reflect(
@@ -330,9 +376,19 @@ class LifeLoop:
             )
 
             for rb in rebindings:
-                last_event = self._emit_event("REBINDING",
-                                              {"source": rb.source_trajectory_id, "target": rb.target_trajectory_id},
-                                              strategic_context.domain, now)
+                # Get updated trajectories
+                source_after = final_trajectory_memory.get_trajectory(rb.source_trajectory_id)
+                target_after = final_trajectory_memory.get_trajectory(rb.target_trajectory_id)
+
+                last_event = self._emit_event(
+                    "REBINDING",
+                    {
+                        "source_trajectory_after": self._serialize_for_event(source_after),
+                        "target_trajectory_after": self._serialize_for_event(target_after)
+                    },
+                    strategic_context.domain,
+                    now
+                )
 
             # E. Horizon Shift
             final_posture = self.horizon_shift_service.evaluate(
@@ -342,9 +398,12 @@ class LifeLoop:
             )
 
             if final_posture.mode != new_posture.mode:
-                last_event = self._emit_event("HORIZON_SHIFT",
-                                              {"from": new_posture.mode.value, "to": final_posture.mode.value},
-                                              strategic_context.domain, now)
+                last_event = self._emit_event(
+                    "HORIZON_SHIFT",
+                    {"posture_after": self._serialize_for_event(final_posture)},
+                    strategic_context.domain,
+                    now
+                )
 
             human.strategy = final_posture
             self.strategic_memory_store.save(strategic_context, new_memory)

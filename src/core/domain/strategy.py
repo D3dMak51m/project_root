@@ -1,5 +1,5 @@
 from dataclasses import dataclass, replace
-from typing import List
+from typing import List, Any, Dict
 from enum import Enum
 
 
@@ -18,7 +18,7 @@ class StrategicPosture:
     confidence_baseline: float = 0.5
     persistence_factor: float = 1.0
 
-    # [NEW] Strategic Mode
+    # Strategic Mode
     mode: StrategicMode = StrategicMode.BALANCED
 
     @property
@@ -38,3 +38,13 @@ class StrategicPosture:
         Ensures immutability.
         """
         return replace(self, **changes)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'StrategicPosture':
+        return cls(
+            engagement_policy=data['engagement_policy'],
+            risk_tolerance=data['risk_tolerance'],
+            confidence_baseline=data['confidence_baseline'],
+            persistence_factor=data['persistence_factor'],
+            mode=StrategicMode(data['mode'])
+        )

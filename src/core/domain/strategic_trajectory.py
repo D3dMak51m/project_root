@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 from datetime import datetime
 from enum import Enum
 
@@ -21,6 +21,16 @@ class StrategicTrajectory:
     commitment_weight: float  # 0.0 - 1.0
     created_at: datetime
     last_updated: datetime
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'StrategicTrajectory':
+        return cls(
+            id=data['id'],
+            status=TrajectoryStatus(data['status']),
+            commitment_weight=data['commitment_weight'],
+            created_at=datetime.fromisoformat(data['created_at']),
+            last_updated=datetime.fromisoformat(data['last_updated'])
+        )
 
 
 @dataclass(frozen=True)
