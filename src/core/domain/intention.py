@@ -13,6 +13,10 @@ class Intention:
     ttl_seconds: int
     metadata: Dict[str, Any]
 
+    def is_expired(self, now: datetime) -> bool:
+        age_seconds = (now - self.created_at).total_seconds()
+        return age_seconds > self.ttl_seconds
+
 @dataclass
 class DeferredAction:
     id: UUID

@@ -11,7 +11,6 @@ from .readiness import ActionReadiness
 from .intention import Intention, DeferredAction
 from .persona import PersonaMask
 from .strategy import StrategicPosture
-# strategic_memory and strategic_trajectory_memory removed as they are context-scoped and stored externally
 
 @dataclass
 class AIHuman:

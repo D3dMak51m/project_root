@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from uuid import UUID
+from uuid import UUID, uuid4
 from datetime import datetime
 from typing import Optional
 
@@ -13,11 +13,14 @@ class ActionProposal:
     energy_cost: float
     created_at: datetime
 
-@dataclass
-class ExecutionResult:
-    success: bool
-    action_taken: Optional[ActionProposal]
-    energy_cost: float
-    readiness_decay: float
-    executed_intention_id: Optional[UUID]
-    memory_content: Optional[str]
+    @classmethod
+    def create(cls, intention_id: UUID, type: str, content: str, now: datetime, risk: float = 0.1) -> 'ActionProposal':
+        return cls(
+            id=uuid4(),
+            intention_id=intention_id,
+            type=type,
+            content=content,
+            risk_level=risk,
+            energy_cost=10.0 + (risk * 10.0),
+            created_at=now
+        )

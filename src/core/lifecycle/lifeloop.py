@@ -1,8 +1,8 @@
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from uuid import uuid4, UUID
 import random
-from typing import Optional, Dict
-from dataclasses import dataclass
+from typing import Optional, Dict, Any
 
 from src.core.domain.entity import AIHuman
 from src.core.domain.intention import Intention, DeferredAction
@@ -18,6 +18,7 @@ from src.core.domain.strategic_signals import StrategicSignals
 from src.core.domain.strategic_context import StrategicContext
 from src.core.domain.strategic_memory import StrategicMemory
 from src.core.domain.strategic_trajectory import StrategicTrajectoryMemory
+from src.core.domain.strategic_snapshot import StrategicSnapshot
 from src.core.lifecycle.signals import LifeSignals
 from src.core.context.internal import InternalContext
 from src.core.services.impulse import ImpulseGenerator
@@ -39,6 +40,13 @@ from src.core.services.trajectory_rebinding import TrajectoryRebindingService
 from src.core.interfaces.strategic_memory_store import StrategicMemoryStore
 from src.core.interfaces.strategic_trajectory_memory_store import StrategicTrajectoryMemoryStore
 from src.core.services.path_key import extract_path_key
+from src.core.time.time_source import TimeSource
+from src.core.time.system_time_source import SystemTimeSource
+from src.core.ledger.strategic_ledger import StrategicLedger
+from src.core.ledger.in_memory_ledger import InMemoryStrategicLedger
+from src.core.ledger.strategic_event import StrategicEvent
+from src.core.observability.strategic_observer import StrategicObserver
+from src.core.observability.null_observer import NullStrategicObserver
 
 
 @dataclass
@@ -50,11 +58,6 @@ class FeedbackModulation:
 
 
 class InMemoryStrategicMemoryStore(StrategicMemoryStore):
-    """
-    Simple in-memory store for C.16.2 demonstration.
-    In production, this would be a DB adapter.
-    """
-
     def __init__(self):
         self._store: Dict[str, StrategicMemory] = {}
 
@@ -68,10 +71,6 @@ class InMemoryStrategicMemoryStore(StrategicMemoryStore):
 
 
 class InMemoryStrategicTrajectoryMemoryStore(StrategicTrajectoryMemoryStore):
-    """
-    Simple in-memory store for C.18.1 demonstration.
-    """
-
     def __init__(self):
         self._store: Dict[str, StrategicTrajectoryMemory] = {}
 
@@ -85,7 +84,16 @@ class InMemoryStrategicTrajectoryMemoryStore(StrategicTrajectoryMemoryStore):
 
 
 class LifeLoop:
-    def __init__(self):
+    def __init__(
+            self,
+            time_source: Optional[TimeSource] = None,
+            ledger: Optional[StrategicLedger] = None,
+            observer: Optional[StrategicObserver] = None
+    ):
+        self.time_source = time_source or SystemTimeSource()
+        self.ledger = ledger or InMemoryStrategicLedger()
+        self.observer = observer or NullStrategicObserver()
+
         self.impulse_generator = ImpulseGenerator()
         self.intention_gate = IntentionGate()
         self.intention_decay = IntentionDecayService()
@@ -103,11 +111,9 @@ class LifeLoop:
         self.strategic_reflection_service = StrategicReflectionService()
         self.trajectory_rebinding_service = TrajectoryRebindingService()
 
-        # Injected dependencies (mock for now)
         self.strategic_memory_store = InMemoryStrategicMemoryStore()
         self.strategic_trajectory_memory_store = InMemoryStrategicTrajectoryMemoryStore()
 
-        # Transient state for window persistence across ticks
         self._current_window: Optional[ExecutionWindow] = None
 
     def _select_mask(self, human: AIHuman) -> Optional[PersonaMask]:
@@ -140,17 +146,52 @@ class LifeLoop:
             mod.intention_decay_factor = 1.5
         return mod
 
+    def _emit_event(self, event_type: str, details: Dict[str, Any], context_domain: str, now: datetime):
+        event = StrategicEvent(
+            id=uuid4(),
+            timestamp=now,
+            event_type=event_type,
+            details=details,
+            context_domain=context_domain
+        )
+        self.ledger.record(event)
+        self.observer.on_event(event)
+
+    def get_strategic_snapshot(self, human: AIHuman, context: StrategicContext) -> StrategicSnapshot:
+        traj_mem = self.strategic_trajectory_memory_store.load(context)
+        mem = self.strategic_memory_store.load(context)
+
+        from src.core.domain.strategic_trajectory import TrajectoryStatus
+
+        active = [t for t in traj_mem.trajectories.values() if t.status == TrajectoryStatus.ACTIVE]
+        stalled = [t for t in traj_mem.trajectories.values() if t.status == TrajectoryStatus.STALLED]
+        abandoned = [t for t in traj_mem.trajectories.values() if t.status == TrajectoryStatus.ABANDONED]
+
+        path_statuses = {str(k): v for k, v in mem.paths.items()}
+
+        return StrategicSnapshot(
+            mode=human.strategy.mode,
+            horizon_days=human.strategy.horizon_days,
+            confidence=human.strategy.confidence_baseline,
+            risk_tolerance=human.strategy.risk_tolerance,
+            persistence_factor=human.strategy.persistence_factor,
+            active_trajectories=active,
+            stalled_trajectories=stalled,
+            abandoned_trajectories=abandoned,
+            path_statuses=path_statuses
+        )
+
     def tick(
-            self,
-            human: AIHuman,
-            signals: LifeSignals,
-            now: datetime,
-            existing_window: Optional[ExecutionWindow] = None,
-            existing_commitment: Optional[ExecutionCommitment] = None,
-            last_executed_intent: Optional[ExecutionIntent] = None
+        self,
+        human: AIHuman,
+        signals: LifeSignals,
+        existing_window: Optional[ExecutionWindow] = None,
+        existing_commitment: Optional[ExecutionCommitment] = None,
+        last_executed_intent: Optional[ExecutionIntent] = None
     ) -> InternalContext:
 
-        # 0. Construct Strategic Context
+        now = self.time_source.now()
+
         strategic_context = StrategicContext(
             country="global",
             region=None,
@@ -194,7 +235,6 @@ class LifeLoop:
                 signals.execution_feedback
             )
 
-            # Ensure strategy exists
             from src.core.domain.strategy import StrategicPosture, StrategicMode
             if not hasattr(human, 'strategy'):
                 human.strategy = StrategicPosture([], 0.5, 0.5, 1.0, StrategicMode.BALANCED)
@@ -209,7 +249,13 @@ class LifeLoop:
                 now
             )
 
-            # B. Update Trajectories (Competition)
+            # Emit events if changed
+            if new_posture != human.strategy:
+                self._emit_event("STRATEGY_ADAPTATION",
+                                 {"old_mode": human.strategy.mode.value, "new_mode": new_posture.mode.value},
+                                 strategic_context.domain, now)
+
+            # B. Update Trajectories
             new_trajectory_memory = self.strategic_trajectory_service.update(
                 current_trajectory_memory,
                 strategic_signals,
@@ -228,6 +274,10 @@ class LifeLoop:
                 now
             )
 
+            for r in reflections:
+                self._emit_event("REFLECTION", {"trajectory": r.trajectory_id, "outcome": r.outcome.value},
+                                 strategic_context.domain, now)
+
             # D. Trajectory Rebinding
             final_trajectory_memory, rebindings = self.trajectory_rebinding_service.rebind(
                 new_trajectory_memory,
@@ -236,12 +286,20 @@ class LifeLoop:
                 now
             )
 
+            for rb in rebindings:
+                self._emit_event("REBINDING", {"source": rb.source_trajectory_id, "target": rb.target_trajectory_id},
+                                 strategic_context.domain, now)
+
             # E. Horizon Shift
             final_posture = self.horizon_shift_service.evaluate(
                 new_posture,
                 new_memory,
                 now
             )
+
+            if final_posture.mode != new_posture.mode:
+                self._emit_event("HORIZON_SHIFT", {"from": new_posture.mode.value, "to": final_posture.mode.value},
+                                 strategic_context.domain, now)
 
             human.strategy = final_posture
             self.strategic_memory_store.save(strategic_context, new_memory)
@@ -250,33 +308,22 @@ class LifeLoop:
             current_memory = new_memory
             current_trajectory_memory = final_trajectory_memory
 
-        # 3. Intention Decay & Inertia
+        # 3. Intention Decay
         surviving_intentions = []
         total_intentions = len(human.intentions)
-
         for intention in human.intentions:
             updated_intention = self.intention_decay.evaluate(
-                intention=intention,
-                state=human.state,
-                readiness=human.readiness,
-                total_intentions=total_intentions,
-                now=now,
-                external_decay_factor=modulation.intention_decay_factor
+                intention, human.state, human.readiness, total_intentions, now, modulation.intention_decay_factor
             )
             if updated_intention:
                 surviving_intentions.append(updated_intention)
-
         human.intentions = surviving_intentions
 
         # 4. Intention Pressure
-        pressure_delta = self.intention_pressure.calculate_pressure(
-            human.intentions,
-            human.state
-        )
+        pressure_delta = self.intention_pressure.calculate_pressure(human.intentions, human.state)
 
         # 5. Update Readiness
         total_pressure = signals.pressure_delta + pressure_delta
-
         if total_pressure > 0:
             human.readiness.accumulate(total_pressure * modulation.readiness_accumulation_factor)
         else:
@@ -284,165 +331,79 @@ class LifeLoop:
             human.readiness.decay(base_decay * modulation.readiness_decay_factor)
 
         # 6. Physics of Volition
-        temp_stance_snapshot = {
-            topic: stance.intensity
-            for topic, stance in human.stance.topics.items()
-        }
+        temp_stance_snapshot = {t: s.intensity for t, s in human.stance.topics.items()}
         temp_context = InternalContext(
-            identity_summary=human.identity.name,
-            current_mood="neutral",
-            energy_level="moderate",
-            recent_thoughts=[],
-            active_intentions_count=len(human.intentions),
-            readiness_level=human.readiness.level(),
-            readiness_value=human.readiness.value,
-            world_perception=None,
-            stance_snapshot=temp_stance_snapshot
+            human.identity.name, "neutral", "moderate", human.memory.recent(5),
+            len(human.intentions), human.readiness.level(), human.readiness.value, None, temp_stance_snapshot
         )
-
         candidates = self.impulse_generator.generate(temp_context, now)
-
         for candidate in candidates:
             if self.intention_gate.allow(candidate, human.state):
                 new_intention = Intention(
-                    id=uuid4(),
-                    type="generated",
-                    content=f"Focus on {candidate.topic}",
-                    priority=float(candidate.pressure / 10.0),
-                    created_at=now,
-                    ttl_seconds=3600,
-                    metadata={"origin": "impulse", "topic": candidate.topic}
+                    uuid4(), "generated", f"Focus on {candidate.topic}", float(candidate.pressure / 10.0),
+                    now, 3600, {"origin": "impulse", "topic": candidate.topic}
                 )
                 human.intentions.append(new_intention)
-                human.state.apply_cost(energy_cost=5.0, attention_cost=2.0)
+                human.state.apply_cost(5.0, 2.0)
 
-        # 7. Strategic Filtering (Memory & Trajectory Aware)
+        # 7. Strategic Filtering
         final_intentions = []
-
-        if not hasattr(human, 'strategy'):
-            human.strategy = StrategicPosture([], 0.5, 0.5, 1.0, StrategicMode.BALANCED)
-
+        from src.core.domain.strategy import StrategicPosture, StrategicMode
+        if not hasattr(human, 'strategy'): human.strategy = StrategicPosture([], 0.5, 0.5, 1.0, StrategicMode.BALANCED)
         for intention in human.intentions:
-            decision = self.strategy_filter.evaluate(
-                intention,
-                human.strategy,
-                current_memory,
-                current_trajectory_memory,
-                strategic_context,
-                now
-            )
-
-            if decision.allow:
-                final_intentions.append(intention)
-            elif decision.suppress:
-                pass
-
+            decision = self.strategy_filter.evaluate(intention, human.strategy, current_memory,
+                                                     current_trajectory_memory, strategic_context, now)
+            if decision.allow: final_intentions.append(intention)
         human.intentions = final_intentions
 
         # 8. Execution Window Logic
-        decay_result: Optional[ExecutionWindowDecayResult] = None
-        active_window: Optional[ExecutionWindow] = None
-        active_commitment: Optional[ExecutionCommitment] = existing_commitment
-
+        decay_result = None
+        active_window = None
+        active_commitment = existing_commitment
         if not active_commitment:
             if existing_window:
-                decay_result = self.window_decay_service.evaluate(
-                    window=existing_window,
-                    state=human.state,
-                    readiness=human.readiness,
-                    now=now
-                )
-
+                decay_result = self.window_decay_service.evaluate(existing_window, human.state, human.readiness, now)
                 if decay_result.outcome == WindowDecayOutcome.PERSIST:
                     active_window = existing_window
                 else:
                     active_window = None
 
-            eligibility_map: Dict[UUID, ExecutionEligibilityResult] = {}
-
+            eligibility_map = {}
             if not active_window:
                 mask = self._select_mask(human)
                 if mask:
                     sorted_intentions = sorted(human.intentions, key=lambda x: x.priority, reverse=True)
-
                     for intention in sorted_intentions:
-                        eligibility = self.eligibility_service.evaluate(
-                            intention=intention,
-                            mask=mask,
-                            state=human.state,
-                            readiness=human.readiness,
-                            reputation=None,
-                            now=now
-                        )
+                        eligibility = self.eligibility_service.evaluate(intention, mask, human.state, human.readiness,
+                                                                        None, now)
                         eligibility_map[intention.id] = eligibility
-
                         if eligibility.allow and active_window is None:
-                            new_window = self.commitment_evaluator.evaluate(
-                                intention=intention,
-                                eligibility=eligibility,
-                                mask=mask,
-                                state=human.state,
-                                readiness=human.readiness,
-                                now=now
-                            )
-                            if new_window:
-                                active_window = new_window
+                            new_window = self.commitment_evaluator.evaluate(intention, eligibility, mask, human.state,
+                                                                            human.readiness, now)
+                            if new_window: active_window = new_window
 
             if active_window:
-                resolution_result = self.resolution_service.resolve(
-                    window=active_window,
-                    state=human.state,
-                    readiness=human.readiness,
-                    now=now
-                )
-
+                resolution_result = self.resolution_service.resolve(active_window, human.state, human.readiness, now)
                 if resolution_result.commitment:
                     active_commitment = resolution_result.commitment
+                    self._emit_event("COMMITMENT_FORMED", {"id": str(active_commitment.id)}, strategic_context.domain,
+                                     now)
+                if resolution_result.window_consumed: active_window = None
 
-                if resolution_result.window_consumed:
-                    active_window = None
-
-        # 9. Execution Binding (Projection)
-        execution_intent: Optional[ExecutionIntent] = None
-
+        # 9. Execution Binding
+        execution_intent = None
         if active_commitment:
-            binding_snapshot = ExecutionBindingSnapshot(
-                energy_value=human.state.energy,
-                fatigue_value=human.state.fatigue,
-                readiness_value=human.readiness.value
-            )
-
-            execution_intent = self.binding_service.bind(
-                commitment=active_commitment,
-                snapshot=binding_snapshot,
-                now=now
-            )
+            binding_snapshot = ExecutionBindingSnapshot(human.state.energy, human.state.fatigue, human.readiness.value)
+            execution_intent = self.binding_service.bind(active_commitment, binding_snapshot, now)
 
         # 10. Build Final InternalContext
-        stance_snapshot = {
-            topic: stance.intensity
-            for topic, stance in human.stance.topics.items()
-        }
-
+        stance_snapshot = {t: s.intensity for t, s in human.stance.topics.items()}
         context = InternalContext(
-            identity_summary=human.identity.name,
-            current_mood="neutral",
-            energy_level=(
-                "high" if human.state.energy > 70
-                else "moderate" if human.state.energy > 30
-                else "low"
-            ),
-            recent_thoughts=human.memory.recent(5),
-            active_intentions_count=len(human.intentions),
-            readiness_level=human.readiness.level(),
-            readiness_value=human.readiness.value,
-            world_perception=None,
-            stance_snapshot=stance_snapshot,
-            execution_eligibility=eligibility_map if not active_commitment else {},
-            execution_window=active_window,
-            last_window_decay=decay_result,
-            execution_commitment=active_commitment,
-            execution_intent=execution_intent
+            human.identity.name, "neutral",
+            "high" if human.state.energy > 70 else "moderate" if human.state.energy > 30 else "low",
+            human.memory.recent(5), len(human.intentions), human.readiness.level(), human.readiness.value, None,
+            stance_snapshot, eligibility_map if not active_commitment else {}, active_window, decay_result,
+            active_commitment, execution_intent
         )
 
         return context
