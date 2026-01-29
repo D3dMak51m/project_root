@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict
 from src.core.domain.resource import StrategicResourceBudget, ResourceCost, ResourceAllocationResult, AllocationStatus
 from src.core.domain.execution_intent import ExecutionIntent
 
@@ -7,9 +7,33 @@ from src.core.domain.execution_intent import ExecutionIntent
 class StrategicResourceManager:
     """
     Pure service. Manages the global strategic resource budget.
-    Handles evaluation, reservation, commitment, and recovery of resources.
-    Enforces strict two-phase resource consumption: evaluate -> reserve -> commit/rollback.
+    Calculates deltas for events, does NOT mutate budget directly.
     """
+
+    def calculate_recovery_delta(self, budget: StrategicResourceBudget, now: datetime) -> Dict[str, float]:
+        """
+        Calculates potential recovery delta based on time passed.
+        Returns delta dict, does not apply it.
+        """
+        delta_hours = (now - budget.last_updated).total_seconds() / 3600.0
+        if delta_hours <= 0:
+            return {}
+
+        energy_gain = budget.energy_recovery_rate * delta_hours
+        attention_gain = budget.attention_recovery_rate * delta_hours
+        slots_gain = int(budget.slot_recovery_rate * delta_hours)
+
+        # Cap gains to not exceed max (logic handled in reducer/application, but delta should reflect potential)
+        # Actually, delta should be precise. If we are at 99 and gain 10, delta is 1?
+        # No, standard event sourcing usually records the calculated delta or the target state.
+        # To keep reducer pure and simple, we record the *calculated gain*.
+        # The reducer applies min(100, current + gain).
+
+        return {
+            "energy": energy_gain,
+            "attention": attention_gain,
+            "slots": float(slots_gain)
+        }
 
     def recover(self, budget: StrategicResourceBudget, now: datetime) -> StrategicResourceBudget:
         """
@@ -42,7 +66,6 @@ class StrategicResourceManager:
         """
         cost = intent.estimated_cost
         if not cost:
-            # Strict rejection: Orchestrator never guesses cost.
             return ResourceAllocationResult(AllocationStatus.INSUFFICIENT_ATTENTION, False)
 
         if budget.execution_slots < cost.execution_slot_cost:
@@ -94,3 +117,10 @@ class StrategicResourceManager:
             attention_recovery_rate=budget.attention_recovery_rate,
             slot_recovery_rate=budget.slot_recovery_rate
         )
+
+    def calculate_reservation_delta(self, cost: ResourceCost) -> Dict[str, float]:
+        return {
+            "energy": -cost.energy_cost,
+            "attention": -cost.attention_cost,
+            "slots": -float(cost.execution_slot_cost)
+        }

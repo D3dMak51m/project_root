@@ -2,6 +2,12 @@ from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
 from uuid import uuid4
 
+from core.domain.budget_snapshot import BudgetSnapshot
+from core.ledger.budget_event import BudgetEvent
+from core.ledger.budget_ledger import BudgetLedger
+from core.ledger.in_memory_budget_ledger import InMemoryBudgetLedger
+from core.persistence.budget_backend import InMemoryBudgetBackend, BudgetPersistenceBackend
+from core.replay.budget_reducer import BudgetReplayReducer
 from core.services.strategic_priority import StrategicPriorityService
 from src.core.domain.entity import AIHuman
 from src.core.domain.strategic_context import StrategicContext
@@ -20,9 +26,8 @@ from src.core.persistence.strategic_state_backend import StrategicStateBackend
 
 class StrategicOrchestrator:
     """
-    Top-level coordinator for the strategic AI core.
-    Manages multiple isolated StrategicContexts, routes signals, and arbitrates execution.
-    Owns context lifecycle, tick cadence, arbitration authority, and GLOBAL RESOURCE BUDGET.
+    Top-level coordinator.
+    Manages contexts and GLOBAL RESOURCE BUDGET via Event Sourcing.
     """
 
     def __init__(
@@ -33,7 +38,9 @@ class StrategicOrchestrator:
             routing_policy: Optional[ContextRoutingPolicy] = None,
             arbitrator: Optional[StrategicArbitrator] = None,
             resource_manager: Optional[StrategicResourceManager] = None,
-            priority_service: Optional[StrategicPriorityService] = None
+            priority_service: Optional[StrategicPriorityService] = None,
+            budget_backend: Optional[BudgetPersistenceBackend] = None,
+            budget_ledger: Optional[BudgetLedger] = None  # [NEW]
     ):
         self.time_source = time_source
         self.ledger = ledger
@@ -42,16 +49,71 @@ class StrategicOrchestrator:
         self.arbitrator = arbitrator or PriorityArbitrator()
         self.resource_manager = resource_manager or StrategicResourceManager()
         self.priority_service = priority_service or StrategicPriorityService()
+        self.budget_backend = budget_backend or InMemoryBudgetBackend()
+        self.budget_ledger = budget_ledger or InMemoryBudgetLedger()  # [NEW]
+        self.budget_reducer = BudgetReplayReducer()  # [NEW]
 
         self._runtimes: Dict[str, StrategicContextRuntime] = {}
         self._last_executed_intent: Optional[ExecutionIntent] = None
 
-        self._budget = StrategicResourceBudget(
-            energy_budget=100.0,
-            attention_budget=100.0,
-            execution_slots=5,
-            last_updated=self.time_source.now()
+        # Initialize Budget (Event Sourced)
+        self._budget = self._restore_budget()
+
+    def _restore_budget(self) -> StrategicResourceBudget:
+        # 1. Load Snapshot
+        snapshot = self.budget_backend.load()
+
+        if snapshot:
+            budget = snapshot.budget
+            last_id = snapshot.last_event_id
+        else:
+            # Cold start
+            budget = StrategicResourceBudget(100.0, 100.0, 5, self.time_source.now())
+            last_id = None
+
+        # 2. Replay Events
+        events = self.budget_ledger.get_history()
+        replay_events = []
+
+        found_snapshot = False
+        if last_id is None:
+            replay_events = events
+        else:
+            for event in events:
+                if found_snapshot:
+                    replay_events.append(event)
+                elif event.id == last_id:
+                    found_snapshot = True
+
+        for event in replay_events:
+            budget = self.budget_reducer.reduce(budget, event)
+
+        return budget
+
+    def _emit_budget_event(self, event_type: str, delta: Dict[str, float], reason: str, now: datetime) -> None:
+        event = BudgetEvent(
+            id=uuid4(),
+            timestamp=now,
+            event_type=event_type,
+            delta=delta,
+            reason=reason
         )
+        self.budget_ledger.record(event)
+        # Apply immediately to in-memory state
+        self._budget = self.budget_reducer.reduce(self._budget, event)
+
+    def _persist_budget(self, now: datetime):
+        # Get last event ID from ledger if available
+        history = self.budget_ledger.get_history()
+        last_id = history[-1].id if history else None
+
+        snapshot = BudgetSnapshot(
+            budget=self._budget,
+            timestamp=now,
+            last_event_id=last_id,
+            version="1.1"
+        )
+        self.budget_backend.save(snapshot)
 
     def register_context(self, context: StrategicContext, human: AIHuman) -> None:
         key = str(context)
@@ -80,31 +142,18 @@ class StrategicOrchestrator:
             del self._runtimes[key]
 
     def tick(self, human: AIHuman, signals: LifeSignals) -> Optional[ExecutionIntent]:
-        """
-        Orchestrates a single tick across all relevant contexts.
-        1. Recover Resources
-        2. Route signals
-        3. Tick relevant LifeLoops
-        4. Collect intents
-        5. Filter Feasible Intents (Budget Check)
-        6. Compute Priorities [NEW]
-        7. Arbitrate
-        8. Reserve Budget
-        9. Update Starvation [NEW]
-        10. Suppress losers
-        """
         now = self.time_source.now()
 
-        # 1. Recover Resources
-        self._budget = self.resource_manager.recover(self._budget, now)
+        # 1. Recover Resources (Event Sourced)
+        recovery_delta = self.resource_manager.calculate_recovery_delta(self._budget, now)
+        if any(v > 0 for v in recovery_delta.values()):
+            self._emit_budget_event("BUDGET_RECOVERED", recovery_delta, "Time-based recovery", now)
 
         # 2. Route Signals
         available_contexts = [r.context for r in self._runtimes.values() if r.active]
         target_contexts = self.routing_policy.resolve(signals, available_contexts)
 
-        # List of (Runtime, Intent)
-        raw_candidates: List[Tuple[StrategicContextRuntime, ExecutionIntent]] = []
-        # Track which runtimes produced an intent for starvation logic
+        candidates: List[Tuple[StrategicContextRuntime, ExecutionIntent]] = []
         runtimes_with_intent = set()
 
         # 3. Tick LifeLoops
@@ -124,68 +173,56 @@ class StrategicOrchestrator:
                 last_executed_intent=self._last_executed_intent
             )
 
-            # 4. Collect Intents
             if internal_context.execution_intent:
                 intent = internal_context.execution_intent
-                # Ensure cost exists (E.7 fix assumption: binding sets it)
-                if not intent.estimated_cost:
-                    # Fallback or skip? E.7 said strict reject.
-                    # We skip if no cost.
-                    pass
-                else:
-                    raw_candidates.append((runtime, intent))
+                if intent.estimated_cost:
+                    candidates.append((runtime, intent))
                     runtimes_with_intent.add(key)
 
-        # 5. Filter Feasible Intents & 6. Compute Priorities
-        # List of (Runtime, Intent, PriorityScore)
-        arbitration_candidates: List[Tuple[StrategicContextRuntime, ExecutionIntent, float]] = []
-
-        for runtime, intent in raw_candidates:
+        # 4. Filter Feasible
+        feasible_candidates = []
+        for runtime, intent in candidates:
             allocation = self.resource_manager.evaluate(intent, self._budget)
             if allocation.approved:
+                # Calculate priority (E.8 logic)
                 priority = self.priority_service.compute_priority(intent, runtime)
-                arbitration_candidates.append((runtime, intent, priority))
+                feasible_candidates.append((runtime, intent, priority))
             else:
-                # Suppress immediately if not feasible
                 runtime.lifeloop.suppress_pending_intentions(human)
 
-        # 7. Arbitrate
+        # 5. Arbitrate
         winner_intent: Optional[ExecutionIntent] = None
         winner_runtime: Optional[StrategicContextRuntime] = None
 
-        if arbitration_candidates:
-            winner = self.arbitrator.select(arbitration_candidates)
+        if feasible_candidates:
+            winner = self.arbitrator.select(feasible_candidates)
             if winner:
                 winner_runtime, winner_intent = winner
 
-                # 8. Reserve Budget
+                # 6. Reserve Budget (Event Sourced)
                 if winner_intent.estimated_cost:
-                    self._budget = self.resource_manager.reserve(self._budget, winner_intent.estimated_cost)
+                    reservation_delta = self.resource_manager.calculate_reservation_delta(winner_intent.estimated_cost)
+                    self._emit_budget_event("BUDGET_RESERVED", reservation_delta, f"Reservation for {winner_intent.id}",
+                                            now)
                     self._last_executed_intent = winner_intent
                 else:
-                    # Should be unreachable
                     winner_intent = None
                     winner_runtime = None
 
-        # 9. Update Starvation & 10. Suppress Losers
-        # Iterate over ALL active runtimes to update starvation
-        for key, runtime in self._runtimes.items():
-            if not runtime.active:
-                continue
+        # 7. Suppress Losers
+        for runtime, intent, _ in feasible_candidates:
+            if runtime != winner_runtime:
+                runtime.lifeloop.suppress_pending_intentions(human)
 
+        # 8. Update Starvation
+        for key, runtime in self._runtimes.items():
+            if not runtime.active: continue
             is_winner = (runtime == winner_runtime)
             has_intent = (key in runtimes_with_intent)
+            runtime.starvation_score = self.priority_service.update_starvation(runtime, is_winner, has_intent)
+            if is_winner: runtime.last_win_tick = runtime.tick_count
 
-            # Update starvation score
-            runtime.starvation_score = self.priority_service.update_starvation(
-                runtime, is_winner, has_intent
-            )
-
-            if is_winner:
-                runtime.last_win_tick = runtime.tick_count
-
-            # Suppress if had intent but didn't win (either infeasible or lost arbitration)
-            if has_intent and not is_winner:
-                runtime.lifeloop.suppress_pending_intentions(human)
+        # 9. Persist Budget (Atomic per tick)
+        self._persist_budget(now)
 
         return winner_intent
