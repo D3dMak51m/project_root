@@ -2,38 +2,15 @@ from datetime import datetime
 from typing import Optional, Dict
 from src.core.domain.resource import StrategicResourceBudget, ResourceCost, ResourceAllocationResult, AllocationStatus
 from src.core.domain.execution_intent import ExecutionIntent
+from src.core.domain.exceptions import BudgetInvariantViolation
 
 
 class StrategicResourceManager:
     """
     Pure service. Manages the global strategic resource budget.
-    Calculates deltas for events, does NOT mutate budget directly.
+    Handles evaluation, reservation, commitment, and recovery of resources.
+    Enforces strict two-phase resource consumption: evaluate -> reserve -> commit/rollback.
     """
-
-    def calculate_recovery_delta(self, budget: StrategicResourceBudget, now: datetime) -> Dict[str, float]:
-        """
-        Calculates potential recovery delta based on time passed.
-        Returns delta dict, does not apply it.
-        """
-        delta_hours = (now - budget.last_updated).total_seconds() / 3600.0
-        if delta_hours <= 0:
-            return {}
-
-        energy_gain = budget.energy_recovery_rate * delta_hours
-        attention_gain = budget.attention_recovery_rate * delta_hours
-        slots_gain = int(budget.slot_recovery_rate * delta_hours)
-
-        # Cap gains to not exceed max (logic handled in reducer/application, but delta should reflect potential)
-        # Actually, delta should be precise. If we are at 99 and gain 10, delta is 1?
-        # No, standard event sourcing usually records the calculated delta or the target state.
-        # To keep reducer pure and simple, we record the *calculated gain*.
-        # The reducer applies min(100, current + gain).
-
-        return {
-            "energy": energy_gain,
-            "attention": attention_gain,
-            "slots": float(slots_gain)
-        }
 
     def recover(self, budget: StrategicResourceBudget, now: datetime) -> StrategicResourceBudget:
         """
@@ -45,7 +22,6 @@ class StrategicResourceManager:
 
         new_energy = min(100.0, budget.energy_budget + (budget.energy_recovery_rate * delta_hours))
         new_attention = min(100.0, budget.attention_budget + (budget.attention_recovery_rate * delta_hours))
-        # TODO: Implement fractional slot recovery or cooldown logic in E.8
         new_slots = min(10, int(budget.execution_slots + (budget.slot_recovery_rate * delta_hours)))
 
         return StrategicResourceBudget(
@@ -57,6 +33,21 @@ class StrategicResourceManager:
             attention_recovery_rate=budget.attention_recovery_rate,
             slot_recovery_rate=budget.slot_recovery_rate
         )
+
+    def calculate_recovery_delta(self, budget: StrategicResourceBudget, now: datetime) -> Dict[str, float]:
+        delta_hours = (now - budget.last_updated).total_seconds() / 3600.0
+        if delta_hours <= 0:
+            return {}
+
+        energy_gain = budget.energy_recovery_rate * delta_hours
+        attention_gain = budget.attention_recovery_rate * delta_hours
+        slots_gain = int(budget.slot_recovery_rate * delta_hours)
+
+        return {
+            "energy": energy_gain,
+            "attention": attention_gain,
+            "slots": float(slots_gain)
+        }
 
     def evaluate(self, intent: ExecutionIntent, budget: StrategicResourceBudget) -> ResourceAllocationResult:
         """
@@ -79,16 +70,33 @@ class StrategicResourceManager:
 
         return ResourceAllocationResult(AllocationStatus.APPROVED, True, reserved_cost=cost)
 
+    def calculate_reservation_delta(self, cost: ResourceCost) -> Dict[str, float]:
+        return {
+            "energy": -cost.energy_cost,
+            "attention": -cost.attention_cost,
+            "slots": -float(cost.execution_slot_cost)
+        }
+
     def reserve(self, budget: StrategicResourceBudget, cost: ResourceCost) -> StrategicResourceBudget:
         """
         Reserves resources from the budget.
         Returns a new budget instance with resources deducted.
-        This is a temporary hold; must be followed by commit() or rollback().
+        Enforces non-negative budget invariant strictly.
         """
+        new_energy = budget.energy_budget - cost.energy_cost
+        new_attention = budget.attention_budget - cost.attention_cost
+        new_slots = budget.execution_slots - cost.execution_slot_cost
+
+        # Invariant Check: Budget cannot be negative
+        if new_energy < 0 or new_attention < 0 or new_slots < 0:
+            raise BudgetInvariantViolation(
+                f"Negative budget after reservation: energy={new_energy}, attention={new_attention}, slots={new_slots}"
+            )
+
         return StrategicResourceBudget(
-            energy_budget=budget.energy_budget - cost.energy_cost,
-            attention_budget=budget.attention_budget - cost.attention_cost,
-            execution_slots=budget.execution_slots - cost.execution_slot_cost,
+            energy_budget=new_energy,
+            attention_budget=new_attention,
+            execution_slots=new_slots,
             last_updated=budget.last_updated,
             energy_recovery_rate=budget.energy_recovery_rate,
             attention_recovery_rate=budget.attention_recovery_rate,
@@ -96,18 +104,9 @@ class StrategicResourceManager:
         )
 
     def commit(self, budget: StrategicResourceBudget) -> StrategicResourceBudget:
-        """
-        Finalizes resource consumption after successful execution.
-        For E.7 this is a semantic no-op as reservation already deducted resources,
-        but it marks the point of no return for resource accounting.
-        Future stages might use this for logging or secondary effects.
-        """
         return budget
 
     def rollback(self, budget: StrategicResourceBudget, cost: ResourceCost) -> StrategicResourceBudget:
-        """
-        Returns resources to the budget (e.g., if execution failed before consumption or was cancelled).
-        """
         return StrategicResourceBudget(
             energy_budget=budget.energy_budget + cost.energy_cost,
             attention_budget=budget.attention_budget + cost.attention_cost,
@@ -117,10 +116,3 @@ class StrategicResourceManager:
             attention_recovery_rate=budget.attention_recovery_rate,
             slot_recovery_rate=budget.slot_recovery_rate
         )
-
-    def calculate_reservation_delta(self, cost: ResourceCost) -> Dict[str, float]:
-        return {
-            "energy": -cost.energy_cost,
-            "attention": -cost.attention_cost,
-            "slots": -float(cost.execution_slot_cost)
-        }

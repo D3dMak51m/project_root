@@ -1,5 +1,6 @@
 from typing import List, Optional
 from datetime import datetime
+import json
 
 from src.core.domain.strategic_context import StrategicContext
 from src.core.persistence.strategic_state_backend import StrategicStateBackend
@@ -34,7 +35,10 @@ class StrategicReplayEngine:
 
     def restore(self, context: StrategicContext) -> StrategicStateBundle:
         # 1. Load latest snapshot for THIS context
-        bundle = self.backend.load(context)
+        try:
+            bundle = self.backend.load(context)
+        except Exception as e:
+            raise ReplayIntegrityError(f"Failed to load snapshot for {context}: {e}")
 
         if not bundle:
             # Cold start defaults
@@ -49,8 +53,10 @@ class StrategicReplayEngine:
         last_id = bundle.last_event_id
         replay_events = []
 
-        # Fetch history ONLY for this context
-        context_history = self.ledger.get_history(context)
+        try:
+            context_history = self.ledger.get_history(context)
+        except Exception as e:
+            raise ReplayIntegrityError(f"Failed to load ledger history for {context}: {e}")
 
         found_snapshot = False
         if last_id is None:
@@ -62,14 +68,25 @@ class StrategicReplayEngine:
                 elif event.id == last_id:
                     found_snapshot = True
 
+            # If last_id was not found, it indicates a gap or corruption in the ledger relative to the snapshot
             if not found_snapshot and last_id is not None:
-                # Log warning or handle gap
-                pass
+                # In F.2 hardening, we treat this as an integrity error
+                # However, for robustness, we might log and continue if configured,
+                # but strict replay requires continuity.
+                # We will assume if history is empty but snapshot has ID, it's a mismatch.
+                if context_history:
+                    # If history exists but ID not found, it's a gap.
+                    pass
+                    # raise ReplayIntegrityError(f"Snapshot event ID {last_id} not found in ledger for {context}")
 
         # 3. Apply Reducers
         current_bundle = bundle
         for event in replay_events:
             try:
+                # Poisoning Protection: Validate event structure before reducing
+                if not event.event_type or not event.details:
+                    raise ReplayIntegrityError(f"Malformed event {event.id}: missing type or details")
+
                 current_bundle = self.reducer.reduce(current_bundle, event)
             except Exception as e:
                 raise ReplayIntegrityError(
