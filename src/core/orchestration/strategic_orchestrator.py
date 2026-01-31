@@ -108,6 +108,10 @@ class StrategicOrchestrator:
         self.budget_ledger.record(event)
         self._budget = self.budget_reducer.reduce(self._budget, event)
 
+        # Observability Hook
+        is_replay = (self.runtime_phase == RuntimePhase.REPLAY)
+        self.observer.on_budget_event(event, is_replay=is_replay)
+
     def _persist_budget(self, now: datetime):
         history = self.budget_ledger.get_history()
         last_id = history[-1].id if history else None
