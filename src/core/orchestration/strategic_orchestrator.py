@@ -2,7 +2,10 @@ from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
 from uuid import uuid4
 
+from core.config.runtime_profile import Environment, RuntimeProfile
+from core.domain.exceptions import SafetyLimitExceeded, PanicMode
 from core.domain.runtime_phase import RuntimePhase
+from core.observability.telemetry_event import TelemetryEvent
 from integration.registry import ExecutionAdapterRegistry
 from src.core.domain.entity import AIHuman
 from src.core.domain.strategic_context import StrategicContext
@@ -35,6 +38,7 @@ class StrategicOrchestrator:
     Top-level coordinator for the strategic AI core.
     Manages multiple isolated StrategicContexts, routes signals, and arbitrates execution.
     Owns context lifecycle, tick cadence, arbitration authority, and GLOBAL RESOURCE BUDGET.
+    Enforces RuntimeProfile safety limits.
     """
 
     def __init__(
@@ -42,19 +46,20 @@ class StrategicOrchestrator:
             time_source: TimeSource,
             ledger: StrategicLedger,
             backend: StrategicStateBackend,
+            profile: Optional[RuntimeProfile] = None,  # [NEW]
             routing_policy: Optional[ContextRoutingPolicy] = None,
             arbitrator: Optional[StrategicArbitrator] = None,
             resource_manager: Optional[StrategicResourceManager] = None,
             priority_service: Optional[StrategicPriorityService] = None,
             budget_backend: Optional[BudgetPersistenceBackend] = None,
             budget_ledger: Optional[BudgetLedger] = None,
-            # execution_adapter: Optional[ExecutionAdapter] = None,
             adapter_registry: Optional[ExecutionAdapterRegistry] = None,
-            runtime_phase: RuntimePhase = RuntimePhase.EXECUTION
+            observer: Optional[Any] = None  # Added for G.2 integration
     ):
         self.time_source = time_source
         self.ledger = ledger
         self.backend = backend
+        self.profile = profile or RuntimeProfile.dev()  # [NEW]
         self.routing_policy = routing_policy or DefaultRoutingPolicy()
         self.arbitrator = arbitrator or PriorityArbitrator()
         self.resource_manager = resource_manager or StrategicResourceManager()
@@ -62,15 +67,21 @@ class StrategicOrchestrator:
         self.budget_backend = budget_backend or InMemoryBudgetBackend()
         self.budget_ledger = budget_ledger or InMemoryBudgetLedger()
         self.budget_reducer = BudgetReplayReducer()
-        # self.execution_adapter = execution_adapter or MockExecutionAdapter()
         self.adapter_registry = adapter_registry or ExecutionAdapterRegistry()
-        self.runtime_phase = runtime_phase
+        self.observer = observer  # Assumed to be injected
+
         self._runtimes: Dict[str, StrategicContextRuntime] = {}
         self._last_executed_intent: Optional[ExecutionIntent] = None
         self._last_execution_result: Optional[ExecutionResult] = None
 
         # Initialize Budget (Event Sourced)
         self._budget = self._restore_budget()
+
+        # Enforce Profile Constraints
+        if self.profile.env == Environment.REPLAY:
+            self.runtime_phase = RuntimePhase.REPLAY
+        else:
+            self.runtime_phase = RuntimePhase.EXECUTION
 
     def _restore_budget(self) -> StrategicResourceBudget:
         snapshot = self.budget_backend.load()
@@ -98,6 +109,21 @@ class StrategicOrchestrator:
         return budget
 
     def _emit_budget_event(self, event_type: str, delta: Dict[str, float], reason: str, now: datetime) -> None:
+        # Safety Limit Check
+        total_delta = sum(abs(v) for v in delta.values())
+        if total_delta > self.profile.limits.max_budget_delta_per_tick:
+            msg = f"Budget delta {total_delta} exceeds limit {self.profile.limits.max_budget_delta_per_tick}"
+            if self.profile.fail_fast:
+                raise SafetyLimitExceeded(msg)
+            else:
+                # Fail-soft: Log and cap/ignore?
+                # For budget integrity, we probably shouldn't apply unsafe deltas.
+                # We'll log error via observer and NOT record event.
+                if self.observer:
+                    self.observer.on_telemetry(
+                        TelemetryEvent(now, "SAFETY_VIOLATION", "Orchestrator", payload={"error": msg}))
+                return
+
         event = BudgetEvent(
             id=uuid4(),
             timestamp=now,
@@ -108,9 +134,8 @@ class StrategicOrchestrator:
         self.budget_ledger.record(event)
         self._budget = self.budget_reducer.reduce(self._budget, event)
 
-        # Observability Hook
-        is_replay = (self.runtime_phase == RuntimePhase.REPLAY)
-        self.observer.on_budget_event(event, is_replay=is_replay)
+        if self.observer:
+            self.observer.on_budget_event(event, is_replay=(self.runtime_phase == RuntimePhase.REPLAY))
 
     def _persist_budget(self, now: datetime):
         history = self.budget_ledger.get_history()
@@ -193,133 +218,144 @@ class StrategicOrchestrator:
     def set_phase(self, phase: RuntimePhase) -> None:
         self.runtime_phase = phase
 
-
     def tick(self, human: AIHuman, signals: LifeSignals) -> Optional[ExecutionIntent]:
-        """
-        Orchestrates a single tick across all relevant contexts.
-        1. Recover Resources
-        2. Inject Feedback (from previous tick)
-        3. Route signals
-        4. Tick relevant LifeLoops
-        5. Collect intents
-        6. Filter Feasible Intents
-        7. Arbitrate
-        8. Reserve Budget
-        9. Execute (External)
-        10. Commit/Rollback Budget
-        11. Suppress losers
-        12. Persist Budget
-        """
         now = self.time_source.now()
+        is_replay = (self.runtime_phase == RuntimePhase.REPLAY)
 
-        # 1. Recover Resources
-        recovery_delta = self.resource_manager.calculate_recovery_delta(self._budget, now)
-        if any(v > 0 for v in recovery_delta.values()):
-            self._emit_budget_event("BUDGET_RECOVERED", recovery_delta, "Time-based recovery", now)
+        if self.observer:
+            self.observer.on_telemetry(TelemetryEvent(now, "TICK_START", "Orchestrator", is_replay=is_replay))
 
-        # 2. Inject Feedback (from previous tick)
-        if self._last_execution_result:
-            signals.execution_feedback = self._last_execution_result
-            self._last_execution_result = None
+        try:
+            # 1. Recover Resources
+            recovery_delta = self.resource_manager.calculate_recovery_delta(self._budget, now)
+            if any(v > 0 for v in recovery_delta.values()):
+                self._emit_budget_event("BUDGET_RECOVERED", recovery_delta, "Time-based recovery", now)
 
-        # 3. Route Signals
-        available_contexts = [r.context for r in self._runtimes.values() if r.active]
-        target_contexts = self.routing_policy.resolve(signals, available_contexts)
+            # 2. Inject Feedback
+            if self._last_execution_result:
+                signals.execution_feedback = self._last_execution_result
+                self._last_execution_result = None
 
-        candidates: List[Tuple[StrategicContextRuntime, ExecutionIntent]] = []
-        runtimes_with_intent = set()
+            # 3. Route Signals
+            available_contexts = [r.context for r in self._runtimes.values() if r.active]
+            target_contexts = self.routing_policy.resolve(signals, available_contexts)
 
-        # 4. Tick LifeLoops
-        for context in target_contexts:
-            key = str(context)
-            runtime = self._runtimes.get(key)
-            if not runtime:
-                continue
+            candidates: List[Tuple[StrategicContextRuntime, ExecutionIntent]] = []
+            runtimes_with_intent = set()
 
-            runtime.tick_count += 1
+            # 4. Tick LifeLoops
+            for context in target_contexts:
+                key = str(context)
+                runtime = self._runtimes.get(key)
+                if not runtime:
+                    continue
 
-            internal_context = runtime.lifeloop.tick(
-                human=human,
-                signals=signals,
-                strategic_context=context,
-                tick_count=runtime.tick_count,
-                last_executed_intent=self._last_executed_intent
-            )
+                # Safety Limit: Max Ticks
+                if runtime.tick_count >= self.profile.limits.max_ticks:
+                    if self.profile.fail_fast:
+                        raise SafetyLimitExceeded(f"Context {key} exceeded max ticks {self.profile.limits.max_ticks}")
+                    continue  # Skip this context
 
-            if internal_context.execution_intent:
-                intent = internal_context.execution_intent
-                if intent.estimated_cost:
-                    candidates.append((runtime, intent))
-                    runtimes_with_intent.add(key)
+                runtime.tick_count += 1
 
-        # 5. Filter Feasible
-        feasible_candidates = []
-        for runtime, intent in candidates:
-            allocation = self.resource_manager.evaluate(intent, self._budget)
-            if allocation.approved:
-                priority = self.priority_service.compute_priority(intent, runtime)
-                feasible_candidates.append((runtime, intent, priority))
-            else:
-                runtime.lifeloop.suppress_pending_intentions(human)
+                internal_context = runtime.lifeloop.tick(
+                    human=human,
+                    signals=signals,
+                    strategic_context=context,
+                    tick_count=runtime.tick_count,
+                    last_executed_intent=self._last_executed_intent
+                )
 
-        # 6. Arbitrate
-        winner_intent: Optional[ExecutionIntent] = None
-        winner_runtime: Optional[StrategicContextRuntime] = None
+                if internal_context.execution_intent:
+                    intent = internal_context.execution_intent
+                    if intent.estimated_cost:
+                        candidates.append((runtime, intent))
+                        runtimes_with_intent.add(key)
 
-        if feasible_candidates:
-            winner = self.arbitrator.select(feasible_candidates)
-            if winner:
-                winner_runtime, winner_intent = winner
+            # 5. Filter Feasible
+            feasible_candidates = []
+            for runtime, intent in candidates:
+                allocation = self.resource_manager.evaluate(intent, self._budget)
+                if allocation.approved:
+                    priority = self.priority_service.compute_priority(intent, runtime)
+                    feasible_candidates.append((runtime, intent, priority))
+                else:
+                    runtime.lifeloop.suppress_pending_intentions(human)
 
-                # 7. Reserve Budget
-                if winner_intent.estimated_cost:
-                    reservation_delta = self.resource_manager.calculate_reservation_delta(winner_intent.estimated_cost)
-                    self._emit_budget_event("BUDGET_RESERVED", reservation_delta, f"Reservation for {winner_intent.id}", now)
-                    self._last_executed_intent = winner_intent
+            # 6. Arbitrate
+            winner_intent: Optional[ExecutionIntent] = None
+            winner_runtime: Optional[StrategicContextRuntime] = None
 
-                    # 8. Execute (External)
-                    if self.runtime_phase == RuntimePhase.REPLAY:
-                        # STRICT REPLAY GUARD
-                        # During replay, we DO NOT execute.
-                        # We also do not generate a result here, because the result
-                        # should come from the log (LifeSignals) in the NEXT tick.
-                        # However, for the logic flow to be consistent, we might need to simulate
-                        # or just skip.
-                        # In Event Sourcing, the result is an event. Here, result is feedback.
-                        # Feedback is injected via signals.
-                        # So we just skip execution.
-                        execution_result = None
-                    else:
-                        # Real Execution via Registry
-                        execution_result = self.adapter_registry.execute_safe(winner_intent)
-                        self._last_execution_result = execution_result
+            if feasible_candidates:
+                winner = self.arbitrator.select(feasible_candidates)
+                if winner:
+                    winner_runtime, winner_intent = winner
 
-                        # 9. Commit/Rollback Budget
-                        # Only if we actually executed and got a failure
-                    if execution_result and execution_result.status in (ExecutionStatus.FAILED,
-                                                                        ExecutionStatus.REJECTED):
-                        rollback_delta = {k: -v for k, v in reservation_delta.items()}
-                        self._emit_budget_event("BUDGET_ROLLED_BACK", rollback_delta,
-                                                f"Rollback for {winner_intent.id}: {execution_result.status.name}", now)
+                    # 7. Reserve Budget
+                    if winner_intent.estimated_cost:
+                        reservation_delta = self.resource_manager.calculate_reservation_delta(
+                            winner_intent.estimated_cost)
+                        self._emit_budget_event("BUDGET_RESERVED", reservation_delta,
+                                                f"Reservation for {winner_intent.id}", now)
+                        self._last_executed_intent = winner_intent
+
+                        # 8. Execute (External)
+                        # Profile Guard: Allow Execution?
+                        if self.profile.allow_execution and self.runtime_phase != RuntimePhase.REPLAY:
+                            execution_result = self.adapter_registry.execute_safe(winner_intent)
+                            self._last_execution_result = execution_result
+
+                            if self.observer:
+                                self.observer.on_execution_result(execution_result, is_replay=False)
+
+                            # 9. Commit/Rollback Budget
+                            if execution_result.status in (ExecutionStatus.FAILED, ExecutionStatus.REJECTED):
+                                rollback_delta = {k: -v for k, v in reservation_delta.items()}
+                                self._emit_budget_event("BUDGET_ROLLED_BACK", rollback_delta,
+                                                        f"Rollback for {winner_intent.id}: {execution_result.status.name}",
+                                                        now)
+                        else:
+                            # Execution suppressed by profile or phase
+                            execution_result = None
+                            # If we reserved but didn't execute due to profile, we should probably rollback or not reserve.
+                            # But reservation happened. If we are in REPLAY, we don't execute, but we replay events.
+                            # If we are in TEST with allow_execution=False, we simulate reservation but no side effect.
+                            pass
 
                     else:
                         winner_intent = None
                         winner_runtime = None
 
-        # 10. Suppress Losers
-        for runtime, intent, _ in feasible_candidates:
-            if runtime != winner_runtime:
-                runtime.lifeloop.suppress_pending_intentions(human)
+            # 10. Suppress Losers
+            for runtime, intent, _ in feasible_candidates:
+                if runtime != winner_runtime:
+                    runtime.lifeloop.suppress_pending_intentions(human)
 
-        # 11. Update Starvation
-        for key, runtime in self._runtimes.items():
-            if not runtime.active: continue
-            is_winner = (runtime == winner_runtime)
-            has_intent = (key in runtimes_with_intent)
-            runtime.starvation_score = self.priority_service.update_starvation(runtime, is_winner, has_intent)
-            if is_winner: runtime.last_win_tick = runtime.tick_count
+            # 11. Update Starvation
+            for key, runtime in self._runtimes.items():
+                if not runtime.active: continue
+                is_winner = (runtime == winner_runtime)
+                has_intent = (key in runtimes_with_intent)
+                runtime.starvation_score = self.priority_service.update_starvation(runtime, is_winner, has_intent)
+                if is_winner: runtime.last_win_tick = runtime.tick_count
 
-        # 12. Persist Budget
-        self._persist_budget(now)
+            # 12. Persist Budget
+            self._persist_budget(now)
 
-        return winner_intent
+            if self.observer:
+                self.observer.on_telemetry(TelemetryEvent(now, "TICK_END", "Orchestrator", payload={
+                    "winner": str(winner_intent.id) if winner_intent else None}, is_replay=is_replay))
+
+            return winner_intent
+
+        except Exception as e:
+            # Global Exception Handling based on Profile
+            if self.profile.fail_fast:
+                raise PanicMode(f"Critical failure in Orchestrator: {e}") from e
+            else:
+                # Fail-soft: Log and continue (return None for this tick)
+                if self.observer:
+                    self.observer.on_telemetry(
+                        TelemetryEvent(now, "CRITICAL_ERROR", "Orchestrator", payload={"error": str(e)},
+                                       is_replay=is_replay))
+                return None
