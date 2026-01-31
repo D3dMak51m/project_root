@@ -2,6 +2,8 @@ from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
 from uuid import uuid4
 
+from core.domain.runtime_phase import RuntimePhase
+from integration.registry import ExecutionAdapterRegistry
 from src.core.domain.entity import AIHuman
 from src.core.domain.strategic_context import StrategicContext
 from src.core.domain.execution_intent import ExecutionIntent
@@ -46,7 +48,9 @@ class StrategicOrchestrator:
             priority_service: Optional[StrategicPriorityService] = None,
             budget_backend: Optional[BudgetPersistenceBackend] = None,
             budget_ledger: Optional[BudgetLedger] = None,
-            execution_adapter: Optional[ExecutionAdapter] = None
+            # execution_adapter: Optional[ExecutionAdapter] = None,
+            adapter_registry: Optional[ExecutionAdapterRegistry] = None,
+            runtime_phase: RuntimePhase = RuntimePhase.EXECUTION
     ):
         self.time_source = time_source
         self.ledger = ledger
@@ -58,8 +62,9 @@ class StrategicOrchestrator:
         self.budget_backend = budget_backend or InMemoryBudgetBackend()
         self.budget_ledger = budget_ledger or InMemoryBudgetLedger()
         self.budget_reducer = BudgetReplayReducer()
-        self.execution_adapter = execution_adapter or MockExecutionAdapter()
-
+        # self.execution_adapter = execution_adapter or MockExecutionAdapter()
+        self.adapter_registry = adapter_registry or ExecutionAdapterRegistry()
+        self.runtime_phase = runtime_phase
         self._runtimes: Dict[str, StrategicContextRuntime] = {}
         self._last_executed_intent: Optional[ExecutionIntent] = None
         self._last_execution_result: Optional[ExecutionResult] = None
@@ -181,6 +186,10 @@ class StrategicOrchestrator:
 
         return None
 
+    def set_phase(self, phase: RuntimePhase) -> None:
+        self.runtime_phase = phase
+
+
     def tick(self, human: AIHuman, signals: LifeSignals) -> Optional[ExecutionIntent]:
         """
         Orchestrates a single tick across all relevant contexts.
@@ -261,23 +270,37 @@ class StrategicOrchestrator:
                 # 7. Reserve Budget
                 if winner_intent.estimated_cost:
                     reservation_delta = self.resource_manager.calculate_reservation_delta(winner_intent.estimated_cost)
-                    self._emit_budget_event("BUDGET_RESERVED", reservation_delta, f"Reservation for {winner_intent.id}",
-                                            now)
+                    self._emit_budget_event("BUDGET_RESERVED", reservation_delta, f"Reservation for {winner_intent.id}", now)
                     self._last_executed_intent = winner_intent
 
                     # 8. Execute (External)
-                    execution_result = self.execution_adapter.execute(winner_intent)
-                    self._last_execution_result = execution_result
+                    if self.runtime_phase == RuntimePhase.REPLAY:
+                        # STRICT REPLAY GUARD
+                        # During replay, we DO NOT execute.
+                        # We also do not generate a result here, because the result
+                        # should come from the log (LifeSignals) in the NEXT tick.
+                        # However, for the logic flow to be consistent, we might need to simulate
+                        # or just skip.
+                        # In Event Sourcing, the result is an event. Here, result is feedback.
+                        # Feedback is injected via signals.
+                        # So we just skip execution.
+                        execution_result = None
+                    else:
+                        # Real Execution via Registry
+                        execution_result = self.adapter_registry.execute_safe(winner_intent)
+                        self._last_execution_result = execution_result
 
-                    # 9. Commit/Rollback Budget
-                    if execution_result.status in (ExecutionStatus.FAILED, ExecutionStatus.REJECTED):
+                        # 9. Commit/Rollback Budget
+                        # Only if we actually executed and got a failure
+                    if execution_result and execution_result.status in (ExecutionStatus.FAILED,
+                                                                        ExecutionStatus.REJECTED):
                         rollback_delta = {k: -v for k, v in reservation_delta.items()}
                         self._emit_budget_event("BUDGET_ROLLED_BACK", rollback_delta,
                                                 f"Rollback for {winner_intent.id}: {execution_result.status.name}", now)
 
-                else:
-                    winner_intent = None
-                    winner_runtime = None
+                    else:
+                        winner_intent = None
+                        winner_runtime = None
 
         # 10. Suppress Losers
         for runtime, intent, _ in feasible_candidates:
