@@ -19,7 +19,7 @@ from src.core.domain.execution_result import ExecutionStatus, ExecutionFailureTy
 from src.core.domain.strategic_signals import StrategicSignals
 from src.core.domain.strategic_context import StrategicContext
 from src.core.domain.strategic_memory import StrategicMemory
-from src.core.domain.strategic_trajectory import StrategicTrajectoryMemory, TrajectoryStatus, StrategicTrajectory
+from src.core.domain.strategic_trajectory import StrategicTrajectoryMemory, TrajectoryStatus
 from src.core.domain.strategic_snapshot import StrategicSnapshot
 from src.core.domain.strategy import StrategicPosture, StrategicMode
 from src.core.lifecycle.signals import LifeSignals
@@ -96,7 +96,8 @@ class LifeLoop:
             ledger: Optional[StrategicLedger] = None,
             observer: Optional[StrategicObserver] = None,
             state_backend: Optional[StrategicStateBackend] = None,
-            snapshot_policy: Optional[SnapshotPolicy] = None
+            snapshot_policy: Optional[SnapshotPolicy] = None,
+            replay_engine: Optional[StrategicReplayEngine] = None  # [NEW] Injected
     ):
         self.time_source = time_source or SystemTimeSource()
         self.ledger = ledger or InMemoryStrategicLedger()
@@ -104,7 +105,8 @@ class LifeLoop:
         self.state_backend = state_backend or InMemoryStrategicStateBackend()
         self.snapshot_policy = snapshot_policy or DefaultSnapshotPolicy()
 
-        self.replay_engine = StrategicReplayEngine(
+        # Replay Engine is now injected or created with dependencies
+        self.replay_engine = replay_engine or StrategicReplayEngine(
             self.state_backend, self.ledger, self.time_source
         )
 
@@ -129,10 +131,17 @@ class LifeLoop:
         self.strategic_trajectory_memory_store = InMemoryStrategicTrajectoryMemoryStore()
 
         self._current_window: Optional[ExecutionWindow] = None
-        # REMOVED: self._tick_counts
+        self._tick_count = 0
 
     def restore(self, human: AIHuman, context: StrategicContext) -> None:
+        """
+        Restores strategic state from backend before first tick.
+        Delegates entirely to StrategicReplayEngine.
+        """
+        # 1. Replay Engine reconstructs state from snapshot + events
         bundle = self.replay_engine.restore(context)
+
+        # 2. Apply restored state to runtime components
         human.strategy = bundle.posture
         self.strategic_memory_store.save(context, bundle.memory)
         self.strategic_trajectory_memory_store.save(context, bundle.trajectory_memory)

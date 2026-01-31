@@ -2,29 +2,30 @@ from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
 from uuid import uuid4
 
-from core.domain.budget_snapshot import BudgetSnapshot
-from core.domain.execution_result import ExecutionResult, ExecutionStatus
-from core.interfaces.execution_adapter import ExecutionAdapter
-from core.ledger.budget_event import BudgetEvent
-from core.ledger.budget_ledger import BudgetLedger
-from core.ledger.in_memory_budget_ledger import InMemoryBudgetLedger
-from core.persistence.budget_backend import InMemoryBudgetBackend, BudgetPersistenceBackend
-from core.replay.budget_reducer import BudgetReplayReducer
-from core.services.strategic_priority import StrategicPriorityService
-from infrastructure.adapters.mock_execution_adapter import MockExecutionAdapter
 from src.core.domain.entity import AIHuman
 from src.core.domain.strategic_context import StrategicContext
 from src.core.domain.execution_intent import ExecutionIntent
 from src.core.domain.resource import StrategicResourceBudget, ResourceCost
+from src.core.domain.budget_snapshot import BudgetSnapshot
+from src.core.domain.execution_result import ExecutionResult, ExecutionStatus
 from src.core.lifecycle.signals import LifeSignals
 from src.core.lifecycle.lifeloop import LifeLoop
 from src.core.orchestration.strategic_context_runtime import StrategicContextRuntime
 from src.core.orchestration.routing_policy import ContextRoutingPolicy, DefaultRoutingPolicy
 from src.core.orchestration.arbitrator import StrategicArbitrator, PriorityArbitrator
 from src.core.services.resource_manager import StrategicResourceManager
+from src.core.services.strategic_priority import StrategicPriorityService
 from src.core.time.time_source import TimeSource
 from src.core.ledger.strategic_ledger import StrategicLedger
+from src.core.ledger.budget_ledger import BudgetLedger
+from src.core.ledger.in_memory_budget_ledger import InMemoryBudgetLedger
+from src.core.ledger.budget_event import BudgetEvent
 from src.core.persistence.strategic_state_backend import StrategicStateBackend
+from src.core.persistence.budget_backend import BudgetPersistenceBackend, InMemoryBudgetBackend
+from src.core.replay.budget_reducer import BudgetReplayReducer
+from src.core.interfaces.execution_adapter import ExecutionAdapter
+from src.infrastructure.adapters.mock_execution_adapter import MockExecutionAdapter
+from src.core.replay.strategic_replay_engine import StrategicReplayEngine
 
 
 class StrategicOrchestrator:
@@ -45,7 +46,7 @@ class StrategicOrchestrator:
             priority_service: Optional[StrategicPriorityService] = None,
             budget_backend: Optional[BudgetPersistenceBackend] = None,
             budget_ledger: Optional[BudgetLedger] = None,
-            execution_adapter: Optional[ExecutionAdapter] = None  # [NEW]
+            execution_adapter: Optional[ExecutionAdapter] = None
     ):
         self.time_source = time_source
         self.ledger = ledger
@@ -57,11 +58,11 @@ class StrategicOrchestrator:
         self.budget_backend = budget_backend or InMemoryBudgetBackend()
         self.budget_ledger = budget_ledger or InMemoryBudgetLedger()
         self.budget_reducer = BudgetReplayReducer()
-        self.execution_adapter = execution_adapter or MockExecutionAdapter()  # [NEW]
+        self.execution_adapter = execution_adapter or MockExecutionAdapter()
 
         self._runtimes: Dict[str, StrategicContextRuntime] = {}
         self._last_executed_intent: Optional[ExecutionIntent] = None
-        self._last_execution_result: Optional[ExecutionResult] = None  # [NEW]
+        self._last_execution_result: Optional[ExecutionResult] = None
 
         # Initialize Budget (Event Sourced)
         self._budget = self._restore_budget()
@@ -117,12 +118,21 @@ class StrategicOrchestrator:
         key = str(context)
         if key in self._runtimes:
             return
+
+        # Create Replay Engine for this context
+        replay_engine = StrategicReplayEngine(
+            self.backend, self.ledger, self.time_source
+        )
+
         lifeloop = LifeLoop(
             time_source=self.time_source,
             ledger=self.ledger,
-            state_backend=self.backend
+            state_backend=self.backend,
+            replay_engine=replay_engine  # [NEW] Inject replay engine
         )
+
         lifeloop.restore(human, context)
+
         runtime = StrategicContextRuntime(
             context=context,
             lifeloop=lifeloop,
@@ -136,20 +146,56 @@ class StrategicOrchestrator:
         if key in self._runtimes:
             del self._runtimes[key]
 
+    def execute_intent(self, intent: ExecutionIntent, runtime: StrategicContextRuntime) -> Optional[ExecutionResult]:
+        """
+        Directly executes an intent, bypassing LifeLoop generation but respecting budget constraints.
+        Used for testing invariants and manual overrides.
+        """
+        now = self.time_source.now()
+
+        # 1. Check Budget Feasibility
+        allocation = self.resource_manager.evaluate(intent, self._budget)
+        if not allocation.approved:
+            return None
+
+        # 2. Reserve Budget
+        if intent.estimated_cost:
+            reservation_delta = self.resource_manager.calculate_reservation_delta(intent.estimated_cost)
+            self._emit_budget_event("BUDGET_RESERVED", reservation_delta, f"Reservation for {intent.id}", now)
+            self._last_executed_intent = intent
+
+            # 3. Execute (External)
+            execution_result = self.execution_adapter.execute(intent)
+            self._last_execution_result = execution_result
+
+            # 4. Commit/Rollback Budget
+            if execution_result.status in (ExecutionStatus.FAILED, ExecutionStatus.REJECTED):
+                rollback_delta = {k: -v for k, v in reservation_delta.items()}
+                self._emit_budget_event("BUDGET_ROLLED_BACK", rollback_delta,
+                                        f"Rollback for {intent.id}: {execution_result.status.name}", now)
+
+            # 5. Persist Budget
+            self._persist_budget(now)
+
+            return execution_result
+
+        return None
+
     def tick(self, human: AIHuman, signals: LifeSignals) -> Optional[ExecutionIntent]:
         """
         Orchestrates a single tick across all relevant contexts.
         1. Recover Resources
-        2. Inject Feedback (from previous tick) [NEW]
+        2. Inject Feedback (from previous tick)
         3. Route signals
         4. Tick relevant LifeLoops
         5. Collect intents
         6. Filter Feasible Intents
         7. Arbitrate
         8. Reserve Budget
-        9. Execute (External) [NEW]
-        10. Commit/Rollback Budget [NEW]
+        9. Execute (External)
+        10. Commit/Rollback Budget
         11. Suppress losers
+        12. Persist Budget
         """
         now = self.time_source.now()
 
@@ -159,11 +205,9 @@ class StrategicOrchestrator:
             self._emit_budget_event("BUDGET_RECOVERED", recovery_delta, "Time-based recovery", now)
 
         # 2. Inject Feedback (from previous tick)
-        # If we have a result from the last tick, inject it into signals
-        # This ensures the feedback loop is closed in the NEXT tick
         if self._last_execution_result:
             signals.execution_feedback = self._last_execution_result
-            self._last_execution_result = None  # Consumed
+            self._last_execution_result = None
 
         # 3. Route Signals
         available_contexts = [r.context for r in self._runtimes.values() if r.active]
@@ -221,19 +265,15 @@ class StrategicOrchestrator:
                                             now)
                     self._last_executed_intent = winner_intent
 
-                    # 8. Execute (External) [NEW]
-                    # This is the boundary crossing.
+                    # 8. Execute (External)
                     execution_result = self.execution_adapter.execute(winner_intent)
                     self._last_execution_result = execution_result
 
-                    # 9. Commit/Rollback Budget [NEW]
+                    # 9. Commit/Rollback Budget
                     if execution_result.status in (ExecutionStatus.FAILED, ExecutionStatus.REJECTED):
-                        # Rollback reservation
-                        # We invert the reservation delta to give it back
                         rollback_delta = {k: -v for k, v in reservation_delta.items()}
                         self._emit_budget_event("BUDGET_ROLLED_BACK", rollback_delta,
                                                 f"Rollback for {winner_intent.id}: {execution_result.status.name}", now)
-                    # Success implies commit (no-op in E.7/E.9 logic, resources already spent)
 
                 else:
                     winner_intent = None
