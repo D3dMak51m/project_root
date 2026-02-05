@@ -47,7 +47,7 @@ class StandardAutonomyStateEvaluator(AutonomyStateEvaluator):
             return AutonomyState(
                 mode=AutonomyMode.SILENT,
                 justification="Low priority interaction defaults to silence",
-                pressure_level=0.1,
+                pressure_level=0.5,  # Pressure remains consistent with READY state
                 constraints=policy.constraints,
                 requires_human=False
             )

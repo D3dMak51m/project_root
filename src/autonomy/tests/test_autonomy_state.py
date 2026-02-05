@@ -69,7 +69,8 @@ def test_low_priority_silence():
     state = evaluator.evaluate(envelope, policy, profile)
 
     assert state.mode == AutonomyMode.SILENT
-    assert state.pressure_level == 0.1
+    # Pressure level must be consistent with READY state (0.5), not arbitrarily lowered
+    assert state.pressure_level == 0.5
 
 
 def test_ready_state():
