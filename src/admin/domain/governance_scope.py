@@ -6,3 +6,4 @@ class GovernanceScope(Enum):
     ESCALATION = "ESCALATION"
     POLICY = "POLICY"
     INTERACTION = "INTERACTION"
+    EXECUTION = "EXECUTION" # [NEW] Explicit execution scope

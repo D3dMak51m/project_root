@@ -1,7 +1,6 @@
 from abc import ABC, abstractmethod
-from typing import List
 from src.autonomy.domain.execution_gate_decision import ExecutionGateDecision
-from src.admin.domain.governance_decision import GovernanceDecision
+from src.governance.runtime.governance_runtime_context import RuntimeGovernanceContext
 
 class GovernanceExecutionResolver(ABC):
     """
@@ -12,6 +11,6 @@ class GovernanceExecutionResolver(ABC):
     def apply(
         self,
         gate_decision: ExecutionGateDecision,
-        governance: List[GovernanceDecision]
+        context: RuntimeGovernanceContext
     ) -> ExecutionGateDecision:
         pass

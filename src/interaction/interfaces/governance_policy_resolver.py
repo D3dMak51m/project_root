@@ -1,7 +1,6 @@
 from abc import ABC, abstractmethod
-from typing import List
 from src.interaction.domain.policy_decision import PolicyDecision
-from src.admin.domain.governance_decision import GovernanceDecision
+from src.governance.runtime.governance_runtime_context import RuntimeGovernanceContext
 
 class GovernancePolicyResolver(ABC):
     """
@@ -12,6 +11,6 @@ class GovernancePolicyResolver(ABC):
     def apply(
         self,
         decision: PolicyDecision,
-        governance: List[GovernanceDecision]
+        context: RuntimeGovernanceContext
     ) -> PolicyDecision:
         pass

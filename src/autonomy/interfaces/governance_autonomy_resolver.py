@@ -1,7 +1,6 @@
 from abc import ABC, abstractmethod
-from typing import List
 from src.autonomy.domain.autonomy_state import AutonomyState
-from src.admin.domain.governance_decision import GovernanceDecision
+from src.governance.runtime.governance_runtime_context import RuntimeGovernanceContext
 
 class GovernanceAutonomyResolver(ABC):
     """
@@ -12,6 +11,6 @@ class GovernanceAutonomyResolver(ABC):
     def apply(
         self,
         autonomy_state: AutonomyState,
-        decisions: List[GovernanceDecision]
+        context: RuntimeGovernanceContext
     ) -> AutonomyState:
         pass
