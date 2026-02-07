@@ -96,7 +96,7 @@ def test_audit_logging(service):
     )
 
     decision = service.process_command(cmd)
-    history = service.audit_store.get_history()
+    history = service.get_audit_history()
 
     assert len(history) == 1
     assert history[0][0] == cmd

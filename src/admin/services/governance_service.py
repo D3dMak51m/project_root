@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from uuid import UUID
 from src.admin.interfaces.governance_service import GovernanceService
 from src.admin.interfaces.admin_command_handler import AdminCommandHandler
@@ -33,7 +33,7 @@ class StandardGovernanceService(GovernanceService):
         self.id_source = id_source
 
     def process_command(self, command: AdminCommand) -> GovernanceDecision:
-        # Inject deterministic values from sources
+        # Inject deterministic values at the boundary
         decision_id = self.id_source.new_id()
         issued_at = self.time_source.now()
 
@@ -55,3 +55,6 @@ class StandardGovernanceService(GovernanceService):
 
     def get_decision(self, decision_id: UUID) -> Optional[GovernanceDecision]:
         return self.state_store.get(decision_id)
+
+    def get_audit_history(self) -> List[Tuple[AdminCommand, GovernanceDecision]]:
+        return self.audit_store.get_history()

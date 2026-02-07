@@ -41,7 +41,7 @@ def test_escalation_approval():
     )
 
     fixed_id = uuid4()
-    fixed_time = datetime(2024, 1, 1, 12, 0, 0)
+    fixed_time = datetime.utcnow()
 
     decision = handler.handle(cmd, fixed_id, fixed_time)
 
