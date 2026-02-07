@@ -1,6 +1,6 @@
 from typing import Dict, Any
 from src.integration.adapters.base import BasePlatformAdapter
-from src.core.domain.execution_intent import ExecutionIntent
+from src.interaction.domain.intent import InteractionIntent, InteractionType
 from src.core.domain.execution_result import ExecutionResult, ExecutionFailureType
 from src.integration.normalizer import ResultNormalizer
 
@@ -8,19 +8,16 @@ from src.integration.normalizer import ResultNormalizer
 class TelegramAdapter(BasePlatformAdapter):
     """
     Stub implementation for Telegram interaction.
-    Demonstrates how to map intents to platform actions.
     """
 
-    def _perform_execution(self, intent: ExecutionIntent) -> ExecutionResult:
+    def _perform_execution(self, intent: InteractionIntent) -> ExecutionResult:
         # 1. Validate Intent Compatibility
-        if intent.abstract_action != "communicate":
-            return ResultNormalizer.rejection("TelegramAdapter only supports 'communicate'")
+        if intent.type != InteractionType.MESSAGE:
+            return ResultNormalizer.rejection("TelegramAdapter only supports MESSAGE type")
 
         # 2. Simulate API Call (Mock)
-        # In real code: telegram_client.send_message(...)
         try:
-            # Simulate network/API logic
-            success = True  # Mock outcome
+            success = True
 
             if success:
                 return ResultNormalizer.success(
@@ -35,7 +32,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
 
         except Exception as e:
-            # Specific API error handling
             return ResultNormalizer.failure(
                 reason=f"Telegram API Error: {str(e)}",
                 failure_type=ExecutionFailureType.ENVIRONMENT

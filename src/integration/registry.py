@@ -1,8 +1,7 @@
 from typing import Dict, Optional
-from datetime import datetime, timezone
 from src.core.interfaces.execution_adapter import ExecutionAdapter
-from src.core.domain.execution_intent import ExecutionIntent
-from src.core.domain.execution_result import ExecutionResult, ExecutionStatus, ExecutionFailureType
+from src.interaction.domain.intent import InteractionIntent
+from src.core.domain.execution_result import ExecutionResult
 from src.integration.normalizer import ResultNormalizer
 
 
@@ -17,21 +16,19 @@ class ExecutionAdapterRegistry:
     def register(self, platform: str, adapter: ExecutionAdapter) -> None:
         self._adapters[platform] = adapter
 
-    def resolve(self, intent: ExecutionIntent) -> Optional[ExecutionAdapter]:
-        # Logic to determine platform from intent
-        # For now, we assume intent.constraints has 'platform' or we use a default
-        platform = intent.constraints.get("platform", "default")
+    def resolve(self, intent: InteractionIntent) -> Optional[ExecutionAdapter]:
+        # Logic to determine platform from intent metadata
+        platform = intent.metadata.get("platform", "default")
         return self._adapters.get(platform)
 
-    def execute_safe(self, intent: ExecutionIntent) -> ExecutionResult:
+    def execute_safe(self, intent: InteractionIntent) -> ExecutionResult:
         """
         Resolves and executes the intent, handling missing adapters safely.
         """
         adapter = self.resolve(intent)
         if not adapter:
             return ResultNormalizer.rejection(
-                reason=f"No adapter found for platform: {intent.constraints.get('platform', 'unknown')}",
-                timestamp=datetime.now(timezone.utc)
+                reason=f"No adapter found for platform: {intent.metadata.get('platform', 'unknown')}"
             )
 
         return adapter.execute(intent)
