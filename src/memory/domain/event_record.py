@@ -1,3 +1,4 @@
+# Updating EventRecord to include context_domain for scoping
 from dataclasses import dataclass
 from uuid import UUID
 from datetime import datetime
@@ -17,7 +18,7 @@ class EventRecord:
     execution_status: ExecutionStatus
     execution_result: Optional[ExecutionResult]
     autonomy_state_before: AutonomyState
-    # autonomy_state_after is not captured here as it evolves in next tick
     policy_decision: PolicyDecision
     governance_snapshot: GovernanceSnapshot
     issued_at: datetime
+    context_domain: str # [NEW] Added for M.4 scoping
