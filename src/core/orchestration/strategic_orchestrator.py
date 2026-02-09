@@ -35,11 +35,29 @@ from src.integration.normalizer import ResultNormalizer
 from src.core.config.runtime_profile import RuntimeProfile, Environment
 from src.core.domain.exceptions import SafetyLimitExceeded, PanicMode
 from src.governance.runtime.governance_runtime_provider import GovernanceRuntimeProvider
+from src.governance.runtime.governance_runtime_context import RuntimeGovernanceContext
 from src.admin.interfaces.governance_service import GovernanceService
 from src.autonomy.services.governance_execution_resolver import StandardGovernanceExecutionResolver
 from src.autonomy.domain.execution_gate_decision import ExecutionGateDecision
 from src.autonomy.services.governance_autonomy_resolver import StandardGovernanceAutonomyResolver
 from src.interaction.services.governance_policy_resolver import StandardGovernancePolicyResolver
+from src.memory.store.memory_store import MemoryStore
+from src.memory.services.memory_ingestion import MemoryIngestionService
+from src.memory.services.memory_query import MemoryQueryService
+from src.memory.domain.event_record import EventRecord
+from src.memory.domain.governance_snapshot import GovernanceSnapshot
+from src.autonomy.domain.autonomy_state import AutonomyState
+from src.autonomy.domain.autonomy_mode import AutonomyMode
+from src.interaction.domain.policy_decision import PolicyDecision
+from src.memory.interfaces.memory_id_source import MemoryIdSource, SystemMemoryIdSource
+from src.memory.services.memory_decay_policy import LinearDecay
+from src.memory.services.temporal_memory_analyzer import TemporalMemoryAnalyzer
+from src.memory.services.memory_signal_builder import MemorySignalBuilder
+from src.memory.services.memory_strategy_adapter import MemoryStrategyAdapter
+from src.memory.services.memory_scope_resolver import MemoryScopeResolver
+from src.memory.store.counterfactual_memory_store import CounterfactualMemoryStore
+from src.memory.services.counterfactual_analyzer import CounterfactualAnalyzer
+from src.memory.domain.counterfactual_event import CounterfactualEvent
 
 
 class StrategicOrchestrator:
@@ -64,7 +82,14 @@ class StrategicOrchestrator:
             budget_ledger: Optional[BudgetLedger] = None,
             adapter_registry: Optional[ExecutionAdapterRegistry] = None,
             observer: Optional[StrategicObserver] = None,
-            governance_service: Optional[GovernanceService] = None
+            governance_service: Optional[GovernanceService] = None,
+            memory_store: Optional[MemoryStore] = None,
+            memory_id_source: Optional[MemoryIdSource] = None,
+            temporal_analyzer: Optional[TemporalMemoryAnalyzer] = None,
+            signal_builder: Optional[MemorySignalBuilder] = None,
+            memory_strategy_adapter: Optional[MemoryStrategyAdapter] = None,
+            memory_scope_resolver: Optional[MemoryScopeResolver] = None,
+            counterfactual_store: Optional[CounterfactualMemoryStore] = None
     ):
         self.time_source = time_source
         self.ledger = ledger
@@ -87,6 +112,19 @@ class StrategicOrchestrator:
         self.governance_autonomy_resolver = StandardGovernanceAutonomyResolver()
         self.governance_policy_resolver = StandardGovernancePolicyResolver()
 
+        self.memory_store = memory_store or MemoryStore()
+        self.memory_ingestion = MemoryIngestionService(self.memory_store)
+        self.memory_query = MemoryQueryService(self.memory_store)
+        self.memory_id_source = memory_id_source or SystemMemoryIdSource()
+
+        self.temporal_analyzer = temporal_analyzer or TemporalMemoryAnalyzer(LinearDecay(3600))
+        self.signal_builder = signal_builder or MemorySignalBuilder()
+        self.memory_strategy_adapter = memory_strategy_adapter or MemoryStrategyAdapter()
+        self.memory_scope_resolver = memory_scope_resolver or MemoryScopeResolver(self.memory_store)
+
+        self.counterfactual_store = counterfactual_store or CounterfactualMemoryStore()
+        self.counterfactual_analyzer = CounterfactualAnalyzer()
+
         self._runtimes: Dict[str, StrategicContextRuntime] = {}
         self._last_executed_intent: Optional[ExecutionIntent] = None
         self._last_execution_result: Optional[ExecutionResult] = None
@@ -100,6 +138,7 @@ class StrategicOrchestrator:
         else:
             self.runtime_phase = RuntimePhase.EXECUTION
 
+    # ... _restore_budget, _emit_budget_event, _persist_budget, register_context, remove_context ... (unchanged)
     def _restore_budget(self) -> StrategicResourceBudget:
         snapshot = self.budget_backend.load()
         if snapshot:
@@ -133,9 +172,6 @@ class StrategicOrchestrator:
             if self.profile.fail_fast:
                 raise SafetyLimitExceeded(msg)
             else:
-                # Fail-soft: Log and cap/ignore?
-                # For budget integrity, we probably shouldn't apply unsafe deltas.
-                # We'll log error via observer and NOT record event.
                 self.observer.on_telemetry(
                     TelemetryEvent(now, "SAFETY_VIOLATION", "Orchestrator", payload={"error": msg}))
                 return
@@ -169,7 +205,6 @@ class StrategicOrchestrator:
         if key in self._runtimes:
             return
 
-        # Create Replay Engine for this context
         replay_engine = StrategicReplayEngine(
             self.backend, self.ledger, self.time_source
         )
@@ -179,7 +214,7 @@ class StrategicOrchestrator:
             ledger=self.ledger,
             state_backend=self.backend,
             replay_engine=replay_engine,
-            observer=self.observer  # Pass observer to LifeLoop
+            observer=self.observer
         )
 
         lifeloop.restore(human, context)
@@ -207,7 +242,7 @@ class StrategicOrchestrator:
         self.observer.on_telemetry(TelemetryEvent(now, "TICK_START", "Orchestrator", is_replay=is_replay))
 
         try:
-            # 0. Fetch Governance Context
+            # 0. Fetch Governance Context [MANDATORY]
             governance_context = None
             if self.governance_provider:
                 governance_context = self.governance_provider.get_context()
@@ -226,24 +261,40 @@ class StrategicOrchestrator:
             available_contexts = [r.context for r in self._runtimes.values() if r.active]
             target_contexts = self.routing_policy.resolve(signals, available_contexts)
 
-            candidates: List[Tuple[StrategicContextRuntime, ExecutionIntent]] = []
+            candidates: List[Tuple[StrategicContextRuntime, ExecutionIntent, float]] = []
             runtimes_with_intent = set()
 
-            # 4. Tick LifeLoops
+            # 4. Tick LifeLoops & Analyze Memory
             for context in target_contexts:
                 key = str(context)
                 runtime = self._runtimes.get(key)
                 if not runtime:
                     continue
 
-                # Safety Limit: Max Ticks
                 if runtime.tick_count >= self.profile.limits.max_ticks:
                     if self.profile.fail_fast:
                         raise SafetyLimitExceeded(f"Context {key} exceeded max ticks {self.profile.limits.max_ticks}")
-                    continue  # Skip this context
+                    continue
 
+                # A. Resolve Scoped Memory
+                scoped_view = self.memory_scope_resolver.resolve(context)
+
+                # Resolve Scoped Counterfactuals
+                scoped_counterfactuals = self.counterfactual_store.list_by_context(context.domain)
+
+                # B. Analyze Scoped Memory
+                recent_events = scoped_view.events[-50:]
+                weighted_events = self.temporal_analyzer.analyze(recent_events, now)
+
+                # Analyze Counterfactuals
+                recent_counterfactuals = scoped_counterfactuals[-50:]
+                cf_metrics = self.counterfactual_analyzer.analyze(recent_counterfactuals, now)
+
+                memory_signal = self.signal_builder.build(weighted_events, self.temporal_analyzer, cf_metrics)
+                memory_context = self.memory_strategy_adapter.adapt(memory_signal)
+
+                # C. Tick LifeLoop
                 runtime.tick_count += 1
-
                 internal_context = runtime.lifeloop.tick(
                     human=human,
                     signals=signals,
@@ -256,25 +307,32 @@ class StrategicOrchestrator:
                 if internal_context.execution_intent:
                     intent = internal_context.execution_intent
                     if intent.estimated_cost:
-                        candidates.append((runtime, intent))
-                        runtimes_with_intent.add(key)
+                        # D. Filter by Memory Context (Cooldown)
+                        if memory_context.cooldown_required:
+                            if intent.risk_level > 0.1:
+                                runtime.lifeloop.suppress_pending_intentions(human)
+                                self._record_counterfactual(intent, "Memory Cooldown", "Memory", governance_context,
+                                                            context, now)
+                                continue
 
-            # 5. Filter Feasible
-            feasible_candidates = []
-            for runtime, intent in candidates:
-                allocation = self.resource_manager.evaluate(intent, self._budget)
-                if allocation.approved:
-                    priority = self.priority_service.compute_priority(intent, runtime)
-                    feasible_candidates.append((runtime, intent, priority))
-                else:
-                    runtime.lifeloop.suppress_pending_intentions(human)
+                        # E. Budget Check
+                        allocation = self.resource_manager.evaluate(intent, self._budget)
+                        if allocation.approved:
+                            # F. Compute Priority (Memory Aware)
+                            priority = self.priority_service.compute_priority(intent, runtime, memory_context)
+                            candidates.append((runtime, intent, priority))
+                            runtimes_with_intent.add(key)
+                        else:
+                            runtime.lifeloop.suppress_pending_intentions(human)
+                            self._record_counterfactual(intent, "Budget Insufficient", "Budget", governance_context,
+                                                        context, now)
 
-            # 6. Arbitrate
+            # 5. Arbitrate
             winner_intent: Optional[ExecutionIntent] = None
             winner_runtime: Optional[StrategicContextRuntime] = None
 
-            if feasible_candidates:
-                winner = self.arbitrator.select(feasible_candidates)
+            if candidates:
+                winner = self.arbitrator.select(candidates)
                 if winner:
                     winner_runtime, winner_intent = winner
 
@@ -284,6 +342,8 @@ class StrategicOrchestrator:
                         final_gate = self.governance_execution_resolver.apply(gate_decision, governance_context)
 
                         if final_gate == ExecutionGateDecision.DENY:
+                            self._record_counterfactual(winner_intent, "Governance Execution Gate", "Governance",
+                                                        governance_context, winner_runtime.context, now)
                             winner_intent = None
                             winner_runtime = None
 
@@ -313,16 +373,38 @@ class StrategicOrchestrator:
                                 execution_result = None
                                 pass
 
+                            # 11. Memory Ingestion
+                            if execution_result:
+                                gov_snapshot = GovernanceSnapshot.from_context(
+                                    governance_context) if governance_context else GovernanceSnapshot.empty()
+                                captured_autonomy = AutonomyState(AutonomyMode.SILENT, "No winner", 0.0, [], False)
+                                captured_policy = PolicyDecision(False, "No winner", [])
+
+                                event_record = EventRecord(
+                                    id=self.memory_id_source.new_id(),  # [FIXED] Use injected source
+                                    intent_id=winner_intent.id,
+                                    execution_status=execution_result.status,
+                                    execution_result=execution_result,
+                                    autonomy_state_before=captured_autonomy,
+                                    policy_decision=captured_policy,
+                                    governance_snapshot=gov_snapshot,
+                                    issued_at=now,
+                                    context_domain=winner_runtime.context.domain
+                                )
+                                self.memory_ingestion.ingest(event_record)
+
                         else:
                             winner_intent = None
                             winner_runtime = None
 
-            # 11. Suppress Losers
-            for runtime, intent, _ in feasible_candidates:
+            # 12. Suppress Losers
+            for runtime, intent, _ in candidates:
                 if runtime != winner_runtime:
                     runtime.lifeloop.suppress_pending_intentions(human)
+                    self._record_counterfactual(intent, "Lost Arbitration", "Arbitration", governance_context,
+                                                runtime.context, now)
 
-            # 12. Update Starvation
+            # 13. Update Starvation
             for key, runtime in self._runtimes.items():
                 if not runtime.active: continue
                 is_winner = (runtime == winner_runtime)
@@ -330,11 +412,12 @@ class StrategicOrchestrator:
                 runtime.starvation_score = self.priority_service.update_starvation(runtime, is_winner, has_intent)
                 if is_winner: runtime.last_win_tick = runtime.tick_count
 
-            # 13. Persist Budget
+            # 14. Persist Budget
             self._persist_budget(now)
 
-            self.observer.on_telemetry(TelemetryEvent(now, "TICK_END", "Orchestrator", payload={
-                "winner": str(winner_intent.id) if winner_intent else None}, is_replay=is_replay))
+            if self.observer:
+                self.observer.on_telemetry(TelemetryEvent(now, "TICK_END", "Orchestrator", payload={
+                    "winner": str(winner_intent.id) if winner_intent else None}, is_replay=is_replay))
 
             return winner_intent
 
@@ -342,7 +425,32 @@ class StrategicOrchestrator:
             if self.profile.fail_fast:
                 raise PanicMode(f"Critical failure in Orchestrator: {e}") from e
             else:
-                self.observer.on_telemetry(
-                    TelemetryEvent(now, "CRITICAL_ERROR", "Orchestrator", payload={"error": str(e)},
-                                   is_replay=is_replay))
+                if self.observer:
+                    self.observer.on_telemetry(
+                        TelemetryEvent(now, "CRITICAL_ERROR", "Orchestrator", payload={"error": str(e)},
+                                       is_replay=is_replay))
                 return None
+
+    def _record_counterfactual(
+            self,
+            intent: ExecutionIntent,
+            reason: str,
+            stage: str,
+            gov_context: Optional[RuntimeGovernanceContext],
+            context: StrategicContext,
+            now: datetime
+    ):
+        gov_snapshot = GovernanceSnapshot.from_context(gov_context) if gov_context else GovernanceSnapshot.empty()
+
+        event = CounterfactualEvent(
+            id=self.memory_id_source.new_id(),  # [FIXED] Use injected source
+            intent_id=intent.id,
+            intent=intent,
+            reason=reason,
+            suppression_stage=stage,
+            policy_decision=None,
+            governance_snapshot=gov_snapshot,
+            context_domain=context.domain,
+            timestamp=now
+        )
+        self.counterfactual_store.append(event)
