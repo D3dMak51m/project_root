@@ -2,6 +2,8 @@ from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
 from uuid import uuid4
 
+from governance.runtime.governance_runtime_context import RuntimeGovernanceContext
+from memory.services import counterfactual_analyzer
 from src.core.domain.entity import AIHuman
 from src.core.domain.strategic_context import StrategicContext
 from src.core.domain.execution_intent import ExecutionIntent
@@ -35,7 +37,6 @@ from src.integration.normalizer import ResultNormalizer
 from src.core.config.runtime_profile import RuntimeProfile, Environment
 from src.core.domain.exceptions import SafetyLimitExceeded, PanicMode
 from src.governance.runtime.governance_runtime_provider import GovernanceRuntimeProvider
-from src.governance.runtime.governance_runtime_context import RuntimeGovernanceContext
 from src.admin.interfaces.governance_service import GovernanceService
 from src.autonomy.services.governance_execution_resolver import StandardGovernanceExecutionResolver
 from src.autonomy.domain.execution_gate_decision import ExecutionGateDecision
@@ -58,6 +59,9 @@ from src.memory.services.memory_scope_resolver import MemoryScopeResolver
 from src.memory.store.counterfactual_memory_store import CounterfactualMemoryStore
 from src.memory.services.counterfactual_analyzer import CounterfactualAnalyzer
 from src.memory.domain.counterfactual_event import CounterfactualEvent
+from src.memory.services.learning_extractor import LearningExtractor
+from src.memory.services.learning_policy_adapter import LearningPolicyAdapter
+from src.memory.domain.strategic_learning_signal import StrategicLearningSignal
 
 
 class StrategicOrchestrator:
@@ -89,7 +93,9 @@ class StrategicOrchestrator:
             signal_builder: Optional[MemorySignalBuilder] = None,
             memory_strategy_adapter: Optional[MemoryStrategyAdapter] = None,
             memory_scope_resolver: Optional[MemoryScopeResolver] = None,
-            counterfactual_store: Optional[CounterfactualMemoryStore] = None
+            counterfactual_store: Optional[CounterfactualMemoryStore] = None,
+            learning_extractor: Optional[LearningExtractor] = None,
+            learning_policy_adapter: Optional[LearningPolicyAdapter] = None
     ):
         self.time_source = time_source
         self.ledger = ledger
@@ -123,7 +129,10 @@ class StrategicOrchestrator:
         self.memory_scope_resolver = memory_scope_resolver or MemoryScopeResolver(self.memory_store)
 
         self.counterfactual_store = counterfactual_store or CounterfactualMemoryStore()
-        self.counterfactual_analyzer = CounterfactualAnalyzer()
+        self.counterfactual_analyzer = counterfactual_analyzer or CounterfactualAnalyzer()
+
+        self.learning_extractor = learning_extractor or LearningExtractor()
+        self.learning_policy_adapter = learning_policy_adapter or LearningPolicyAdapter()
 
         self._runtimes: Dict[str, StrategicContextRuntime] = {}
         self._last_executed_intent: Optional[ExecutionIntent] = None
@@ -138,7 +147,6 @@ class StrategicOrchestrator:
         else:
             self.runtime_phase = RuntimePhase.EXECUTION
 
-    # ... _restore_budget, _emit_budget_event, _persist_budget, register_context, remove_context ... (unchanged)
     def _restore_budget(self) -> StrategicResourceBudget:
         snapshot = self.budget_backend.load()
         if snapshot:
@@ -242,7 +250,7 @@ class StrategicOrchestrator:
         self.observer.on_telemetry(TelemetryEvent(now, "TICK_START", "Orchestrator", is_replay=is_replay))
 
         try:
-            # 0. Fetch Governance Context [MANDATORY]
+            # 0. Fetch Governance Context
             governance_context = None
             if self.governance_provider:
                 governance_context = self.governance_provider.get_context()
@@ -264,6 +272,9 @@ class StrategicOrchestrator:
             candidates: List[Tuple[StrategicContextRuntime, ExecutionIntent, float]] = []
             runtimes_with_intent = set()
 
+            # Store analysis results for post-execution learning
+            context_analysis_results = {}
+
             # 4. Tick LifeLoops & Analyze Memory
             for context in target_contexts:
                 key = str(context)
@@ -278,20 +289,24 @@ class StrategicOrchestrator:
 
                 # A. Resolve Scoped Memory
                 scoped_view = self.memory_scope_resolver.resolve(context)
-
-                # Resolve Scoped Counterfactuals
                 scoped_counterfactuals = self.counterfactual_store.list_by_context(context.domain)
 
                 # B. Analyze Scoped Memory
                 recent_events = scoped_view.events[-50:]
                 weighted_events = self.temporal_analyzer.analyze(recent_events, now)
 
-                # Analyze Counterfactuals
                 recent_counterfactuals = scoped_counterfactuals[-50:]
                 cf_metrics = self.counterfactual_analyzer.analyze(recent_counterfactuals, now)
 
                 memory_signal = self.signal_builder.build(weighted_events, self.temporal_analyzer, cf_metrics)
                 memory_context = self.memory_strategy_adapter.adapt(memory_signal)
+
+                # Store for learning phase
+                context_analysis_results[key] = {
+                    "memory_signal": memory_signal,
+                    "recent_events": recent_events,
+                    "recent_counterfactuals": recent_counterfactuals
+                }
 
                 # C. Tick LifeLoop
                 runtime.tick_count += 1
@@ -381,7 +396,7 @@ class StrategicOrchestrator:
                                 captured_policy = PolicyDecision(False, "No winner", [])
 
                                 event_record = EventRecord(
-                                    id=self.memory_id_source.new_id(),  # [FIXED] Use injected source
+                                    id=self.memory_id_source.new_id(),
                                     intent_id=winner_intent.id,
                                     execution_status=execution_result.status,
                                     execution_result=execution_result,
@@ -412,12 +427,52 @@ class StrategicOrchestrator:
                 runtime.starvation_score = self.priority_service.update_starvation(runtime, is_winner, has_intent)
                 if is_winner: runtime.last_win_tick = runtime.tick_count
 
-            # 14. Persist Budget
+            # 14. Strategic Learning Loop (Post-Execution) [NEW]
+            # Aggregate learning signals and apply ONCE per tick
+            aggregated_learning_signal = None
+
+            # Collect signals from all contexts
+            learning_signals = []
+            for key, analysis in context_analysis_results.items():
+                signal = self.learning_extractor.extract(
+                    analysis["memory_signal"],
+                    analysis["recent_events"],
+                    analysis["recent_counterfactuals"]
+                )
+                learning_signals.append(signal)
+
+            # Aggregate signals (Conservative Merge)
+            if learning_signals:
+                # Logic: OR for booleans, Average for bias
+                avoid_risk = any(s.avoid_risk_patterns for s in learning_signals)
+                reduce_expl = any(s.reduce_exploration for s in learning_signals)
+                policy_press = any(s.policy_pressure_high for s in learning_signals)
+                gov_deadlock = any(s.governance_deadlock_detected for s in learning_signals)
+                avg_bias = sum(s.long_term_priority_bias for s in learning_signals) / len(learning_signals)
+
+                aggregated_learning_signal = StrategicLearningSignal(
+                    avoid_risk_patterns=avoid_risk,
+                    reduce_exploration=reduce_expl,
+                    policy_pressure_high=policy_press,
+                    governance_deadlock_detected=gov_deadlock,
+                    long_term_priority_bias=avg_bias
+                )
+
+            # Apply Learning ONCE
+            if aggregated_learning_signal:
+                current_posture = human.strategy
+                new_posture = self.learning_policy_adapter.adapt_posture(current_posture, aggregated_learning_signal)
+
+                if new_posture != current_posture:
+                    human.strategy = new_posture
+                    # No event emission here per M.6 FIX requirements
+                    # Learning is silent and internal
+
+            # 15. Persist Budget
             self._persist_budget(now)
 
-            if self.observer:
-                self.observer.on_telemetry(TelemetryEvent(now, "TICK_END", "Orchestrator", payload={
-                    "winner": str(winner_intent.id) if winner_intent else None}, is_replay=is_replay))
+            self.observer.on_telemetry(TelemetryEvent(now, "TICK_END", "Orchestrator", payload={
+                "winner": str(winner_intent.id) if winner_intent else None}, is_replay=is_replay))
 
             return winner_intent
 
@@ -425,10 +480,9 @@ class StrategicOrchestrator:
             if self.profile.fail_fast:
                 raise PanicMode(f"Critical failure in Orchestrator: {e}") from e
             else:
-                if self.observer:
-                    self.observer.on_telemetry(
-                        TelemetryEvent(now, "CRITICAL_ERROR", "Orchestrator", payload={"error": str(e)},
-                                       is_replay=is_replay))
+                self.observer.on_telemetry(
+                    TelemetryEvent(now, "CRITICAL_ERROR", "Orchestrator", payload={"error": str(e)},
+                                   is_replay=is_replay))
                 return None
 
     def _record_counterfactual(
@@ -443,7 +497,7 @@ class StrategicOrchestrator:
         gov_snapshot = GovernanceSnapshot.from_context(gov_context) if gov_context else GovernanceSnapshot.empty()
 
         event = CounterfactualEvent(
-            id=self.memory_id_source.new_id(),  # [FIXED] Use injected source
+            id=self.memory_id_source.new_id(),
             intent_id=intent.id,
             intent=intent,
             reason=reason,
