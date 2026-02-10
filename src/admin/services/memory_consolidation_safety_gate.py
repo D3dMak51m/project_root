@@ -57,3 +57,4 @@ class MemoryConsolidationSafetyGate:
             allowed=allowed,
             reasons=reasons
         )
+
