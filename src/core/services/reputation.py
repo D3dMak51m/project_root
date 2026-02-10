@@ -1,0 +1,2 @@
+class ReputationService:
+    pass
