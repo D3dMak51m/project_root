@@ -1,0 +1,118 @@
+from datetime import datetime, timezone
+from typing import Optional
+
+from src.core.interfaces.execution_adapter import ExecutionAdapter
+from src.core.domain.execution_intent import ExecutionIntent
+from src.core.domain.execution_result import ExecutionResult, ExecutionStatus, ExecutionFailureType
+from src.integration.normalizer import ResultNormalizer
+from src.infrastructure.adapters.telegram.telegram_client import TelegramClient
+from src.infrastructure.adapters.telegram.telegram_errors import (
+    TelegramError, TelegramRateLimitError, TelegramForbiddenError, TelegramNetworkError
+)
+from src.infrastructure.adapters.telegram.telegram_idempotency import TelegramIdempotencyCache
+from src.integration.registry import ExecutionAdapterRegistry
+
+
+class TelegramExecutionAdapter(ExecutionAdapter):
+    """
+    Outbound-only execution adapter for Telegram.
+    Translates ExecutionIntent into Telegram API calls.
+    Enforces idempotency and handles platform-specific errors.
+    """
+
+    def __init__(self, token: str, default_chat_id: Optional[str] = None):
+        self.client = TelegramClient(token)
+        self.default_chat_id = default_chat_id
+        self.idempotency = TelegramIdempotencyCache()
+
+    def execute(self, intent: ExecutionIntent) -> ExecutionResult:
+        # 1. Idempotency Check
+        if self.idempotency.is_processed(intent.id):
+            return ResultNormalizer.success(
+                effects=["message_deduplicated"],
+                costs={"api_calls": 0.0},
+                observations={"deduplicated": True, "original_meta": self.idempotency.get_metadata(intent.id)}
+            )
+
+        # 2. Validate Intent Platform (Safety check)
+        # Assuming intent constraints or abstract_action implies platform,
+        # but here we check if it was routed correctly.
+        # For T1, we assume if it reached here, it's for Telegram.
+
+        # 3. Extract Payload
+        # ExecutionIntent constraints/metadata should hold the payload
+        # We look for 'text' and 'target_id' in constraints
+        text = intent.constraints.get("text")
+        target_id = intent.constraints.get("target_id") or self.default_chat_id
+
+        if not text:
+            return ResultNormalizer.failure(
+                reason="No text content provided in intent constraints",
+                failure_type=ExecutionFailureType.INTERNAL
+            )
+
+        if not target_id:
+            return ResultNormalizer.failure(
+                reason="No target_id provided for Telegram message",
+                failure_type=ExecutionFailureType.INTERNAL
+            )
+
+        # 4. Execute via Client
+        try:
+            # Use None for parse_mode to be safe by default, or HTML if needed
+            result = self.client.send_message(
+                chat_id=target_id,
+                text=text,
+                parse_mode=None
+            )
+
+            # Mark as processed
+            self.idempotency.mark_processed(intent.id, {"message_id": result.get("message_id")})
+
+            return ResultNormalizer.success(
+                effects=["message_sent"],
+                costs={"api_calls": 1.0},
+                observations={"message_id": result.get("message_id")}
+            )
+
+        except TelegramRateLimitError as e:
+            return ResultNormalizer.failure(
+                reason=f"Rate limit exceeded. Retry after {e.retry_after}s",
+                failure_type=ExecutionFailureType.ENVIRONMENT,
+                costs={"api_calls": 1.0}
+            )
+
+        except TelegramForbiddenError as e:
+            return ResultNormalizer.failure(
+                reason=f"Bot blocked by user: {e.description}",
+                failure_type=ExecutionFailureType.POLICY,
+                costs={"api_calls": 1.0}
+            )
+
+        except TelegramNetworkError as e:
+            return ResultNormalizer.failure(
+                reason=f"Network error: {str(e)}",
+                failure_type=ExecutionFailureType.ENVIRONMENT
+            )
+
+        except TelegramError as e:
+            return ResultNormalizer.failure(
+                reason=f"Telegram API error: {str(e)}",
+                failure_type=ExecutionFailureType.ENVIRONMENT,
+                costs={"api_calls": 1.0}
+            )
+
+        except Exception as e:
+            return ResultNormalizer.failure(
+                reason=f"Unexpected adapter error: {str(e)}",
+                failure_type=ExecutionFailureType.INTERNAL
+            )
+
+
+# Explicit Registration (Side-effect on import)
+# In a real app, this might be done in a bootstrap phase, but for T1 compliance:
+# We register a placeholder or rely on manual instantiation in main.
+# However, to satisfy the "Explicit Registration" requirement without hardcoding tokens:
+def register_telegram_adapter(token: str, default_chat_id: Optional[str] = None):
+    registry = ExecutionAdapterRegistry.get_global()
+    registry.register("telegram", TelegramExecutionAdapter(token, default_chat_id))
