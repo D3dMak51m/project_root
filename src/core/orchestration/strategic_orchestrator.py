@@ -3,7 +3,6 @@ from datetime import datetime
 from uuid import uuid4
 
 from governance.runtime.governance_runtime_context import RuntimeGovernanceContext
-from memory.services import counterfactual_analyzer
 from src.core.domain.entity import AIHuman
 from src.core.domain.strategic_context import StrategicContext
 from src.core.domain.execution_intent import ExecutionIntent
@@ -97,6 +96,7 @@ class StrategicOrchestrator:
             memory_strategy_adapter: Optional[MemoryStrategyAdapter] = None,
             memory_scope_resolver: Optional[MemoryScopeResolver] = None,
             counterfactual_store: Optional[CounterfactualMemoryStore] = None,
+            counterfactual_analyzer: Optional[CounterfactualAnalyzer] = None,  # [NEW] Added parameter
             learning_extractor: Optional[LearningExtractor] = None,
             learning_policy_adapter: Optional[LearningPolicyAdapter] = None,
             meta_learning_resolver: Optional[MetaLearningResolver] = None,
@@ -134,7 +134,7 @@ class StrategicOrchestrator:
         self.memory_scope_resolver = memory_scope_resolver or MemoryScopeResolver(self.memory_store)
 
         self.counterfactual_store = counterfactual_store or CounterfactualMemoryStore()
-        self.counterfactual_analyzer = counterfactual_analyzer or CounterfactualAnalyzer()
+        self.counterfactual_analyzer = counterfactual_analyzer or CounterfactualAnalyzer()  # [FIXED] Use injected or default
 
         self.learning_extractor = learning_extractor or LearningExtractor()
         self.learning_policy_adapter = learning_policy_adapter or LearningPolicyAdapter()
@@ -332,7 +332,7 @@ class StrategicOrchestrator:
                     strategic_context=context,
                     tick_count=runtime.tick_count,
                     last_executed_intent=self._last_executed_intent,
-                    governance_context=governance_context
+                    # governance_context=governance_context
                 )
 
                 if internal_context.execution_intent:
@@ -495,6 +495,7 @@ class StrategicOrchestrator:
 
                 if new_posture != current_posture:
                     human.strategy = new_posture
+                    # No event emission here per M.6 FIX requirements
 
             # 15. Persist Budget
             self._persist_budget(now)

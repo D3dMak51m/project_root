@@ -3,7 +3,6 @@ name = "aihuman"
 version = "0.1.0"
 description = "Autonomous AI Human Core"
 requires-python = ">=3.9"
-pythonpath = ["src"]
 dependencies = [
     "pydantic>=2.0",
     "sqlalchemy>=2.0",

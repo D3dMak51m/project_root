@@ -1,58 +1,56 @@
-from datetime import datetime, timezone
-from uuid import uuid4
 import random
-from typing import Optional, Dict, Any
 from dataclasses import dataclass, asdict
+from datetime import datetime
+from typing import Optional, Dict, Any
+from uuid import uuid4
 
 from core.interfaces.strategic_memory_store import StrategicMemoryStore
 from core.interfaces.strategic_trajectory_memory_store import StrategicTrajectoryMemoryStore
-from src.core.domain.entity import AIHuman
-from src.core.domain.intention import Intention, DeferredAction
-from src.core.domain.persona import PersonaMask
-from src.core.domain.execution import ExecutionEligibilityResult
-from src.core.domain.window import ExecutionWindow
-from src.core.domain.window_decay import WindowDecayOutcome, ExecutionWindowDecayResult
+from src.core.context.internal import InternalContext
 from src.core.domain.commitment import ExecutionCommitment
-from src.core.domain.execution_intent import ExecutionIntent
+from src.core.domain.entity import AIHuman
 from src.core.domain.execution_binding import ExecutionBindingSnapshot
+from src.core.domain.execution_intent import ExecutionIntent
 from src.core.domain.execution_result import ExecutionStatus, ExecutionFailureType
-from src.core.domain.strategic_signals import StrategicSignals
+from src.core.domain.intention import Intention
+from src.core.domain.persona import PersonaMask
 from src.core.domain.strategic_context import StrategicContext
 from src.core.domain.strategic_memory import StrategicMemory
-from src.core.domain.strategic_trajectory import StrategicTrajectoryMemory, TrajectoryStatus
 from src.core.domain.strategic_snapshot import StrategicSnapshot
+from src.core.domain.strategic_trajectory import StrategicTrajectoryMemory, TrajectoryStatus
 from src.core.domain.strategy import StrategicPosture, StrategicMode
-from src.core.lifecycle.signals import LifeSignals
-from src.core.context.internal import InternalContext
-from src.core.services.impulse import ImpulseGenerator
-from src.core.services.intention_gate import IntentionGate
-from src.core.services.intention_decay import IntentionDecayService
-from src.core.services.intention_pressure import IntentionPressureService
-from src.core.services.strategy_filter import StrategicFilterService
-from src.core.services.execution_eligibility import ExecutionEligibilityService
-from src.core.services.commitment import CommitmentEvaluator
-from src.core.services.window_decay import ExecutionWindowDecayService
-from src.core.services.resolution import CommitmentResolutionService
-from src.core.services.execution_binding import ExecutionBindingService
-from src.core.services.strategic_interpreter import StrategicFeedbackInterpreter
-from src.core.services.strategy_adaptation import StrategyAdaptationService
-from src.core.services.strategic_trajectory import StrategicTrajectoryService
-from src.core.services.horizon_shift import HorizonShiftService
-from src.core.services.strategic_reflection import StrategicReflectionService
-from src.core.services.trajectory_rebinding import TrajectoryRebindingService
-from src.core.services.path_key import extract_path_key
-from src.core.time.time_source import TimeSource
-from src.core.time.system_time_source import SystemTimeSource
-from src.core.ledger.strategic_ledger import StrategicLedger
+from src.core.domain.window import ExecutionWindow
+from src.core.domain.window_decay import WindowDecayOutcome
 from src.core.ledger.in_memory_ledger import InMemoryStrategicLedger
 from src.core.ledger.strategic_event import StrategicEvent
-from src.core.observability.strategic_observer import StrategicObserver
+from src.core.ledger.strategic_ledger import StrategicLedger
+from src.core.lifecycle.signals import LifeSignals
 from src.core.observability.null_observer import NullStrategicObserver
-from src.core.persistence.strategic_state_backend import StrategicStateBackend
+from src.core.observability.strategic_observer import StrategicObserver
 from src.core.persistence.in_memory_backend import InMemoryStrategicStateBackend
-from src.core.persistence.strategic_state_bundle import StrategicStateBundle
 from src.core.persistence.snapshot_policy import SnapshotPolicy, DefaultSnapshotPolicy
+from src.core.persistence.strategic_state_backend import StrategicStateBackend
+from src.core.persistence.strategic_state_bundle import StrategicStateBundle
 from src.core.replay.strategic_replay_engine import StrategicReplayEngine
+from src.core.services.commitment import CommitmentEvaluator
+from src.core.services.execution_binding import ExecutionBindingService
+from src.core.services.execution_eligibility import ExecutionEligibilityService
+from src.core.services.horizon_shift import HorizonShiftService
+from src.core.services.impulse import ImpulseGenerator
+from src.core.services.intention_decay import IntentionDecayService
+from src.core.services.intention_gate import IntentionGate
+from src.core.services.intention_pressure import IntentionPressureService
+from src.core.services.path_key import extract_path_key
+from src.core.services.resolution import CommitmentResolutionService
+from src.core.services.strategic_interpreter import StrategicFeedbackInterpreter
+from src.core.services.strategic_reflection import StrategicReflectionService
+from src.core.services.strategic_trajectory import StrategicTrajectoryService
+from src.core.services.strategy_adaptation import StrategyAdaptationService
+from src.core.services.strategy_filter import StrategicFilterService
+from src.core.services.trajectory_rebinding import TrajectoryRebindingService
+from src.core.services.window_decay import ExecutionWindowDecayService
+from src.core.time.system_time_source import SystemTimeSource
+from src.core.time.time_source import TimeSource
 
 
 @dataclass
