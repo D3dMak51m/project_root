@@ -62,6 +62,9 @@ from src.memory.domain.counterfactual_event import CounterfactualEvent
 from src.memory.services.learning_extractor import LearningExtractor
 from src.memory.services.learning_policy_adapter import LearningPolicyAdapter
 from src.memory.domain.strategic_learning_signal import StrategicLearningSignal
+from src.memory.domain.meta_learning_policy import MetaLearningPolicy
+from src.memory.domain.meta_learning_context import MetaLearningContext
+from src.memory.services.meta_learning_resolver import MetaLearningResolver
 
 
 class StrategicOrchestrator:
@@ -95,7 +98,9 @@ class StrategicOrchestrator:
             memory_scope_resolver: Optional[MemoryScopeResolver] = None,
             counterfactual_store: Optional[CounterfactualMemoryStore] = None,
             learning_extractor: Optional[LearningExtractor] = None,
-            learning_policy_adapter: Optional[LearningPolicyAdapter] = None
+            learning_policy_adapter: Optional[LearningPolicyAdapter] = None,
+            meta_learning_resolver: Optional[MetaLearningResolver] = None,
+            meta_learning_policy: Optional[MetaLearningPolicy] = None
     ):
         self.time_source = time_source
         self.ledger = ledger
@@ -133,6 +138,11 @@ class StrategicOrchestrator:
 
         self.learning_extractor = learning_extractor or LearningExtractor()
         self.learning_policy_adapter = learning_policy_adapter or LearningPolicyAdapter()
+
+        self.meta_learning_resolver = meta_learning_resolver or MetaLearningResolver()
+        self.meta_learning_policy = meta_learning_policy or MetaLearningPolicy.default()
+
+        self._ticks_since_failure = 100
 
         self._runtimes: Dict[str, StrategicContextRuntime] = {}
         self._last_executed_intent: Optional[ExecutionIntent] = None
@@ -265,6 +275,14 @@ class StrategicOrchestrator:
                 signals.execution_feedback = self._last_execution_result
                 self._last_execution_result = None
 
+                # Update failure tracker
+                if signals.execution_feedback.status in (ExecutionStatus.FAILED, ExecutionStatus.REJECTED):
+                    self._ticks_since_failure = 0
+                else:
+                    self._ticks_since_failure += 1
+            else:
+                self._ticks_since_failure += 1
+
             # 3. Route Signals
             available_contexts = [r.context for r in self._runtimes.values() if r.active]
             target_contexts = self.routing_policy.resolve(signals, available_contexts)
@@ -272,7 +290,6 @@ class StrategicOrchestrator:
             candidates: List[Tuple[StrategicContextRuntime, ExecutionIntent, float]] = []
             runtimes_with_intent = set()
 
-            # Store analysis results for post-execution learning
             context_analysis_results = {}
 
             # 4. Tick LifeLoops & Analyze Memory
@@ -301,7 +318,6 @@ class StrategicOrchestrator:
                 memory_signal = self.signal_builder.build(weighted_events, self.temporal_analyzer, cf_metrics)
                 memory_context = self.memory_strategy_adapter.adapt(memory_signal)
 
-                # Store for learning phase
                 context_analysis_results[key] = {
                     "memory_signal": memory_signal,
                     "recent_events": recent_events,
@@ -427,11 +443,9 @@ class StrategicOrchestrator:
                 runtime.starvation_score = self.priority_service.update_starvation(runtime, is_winner, has_intent)
                 if is_winner: runtime.last_win_tick = runtime.tick_count
 
-            # 14. Strategic Learning Loop (Post-Execution) [NEW]
-            # Aggregate learning signals and apply ONCE per tick
+            # 14. Strategic Learning Loop (Post-Execution)
             aggregated_learning_signal = None
 
-            # Collect signals from all contexts
             learning_signals = []
             for key, analysis in context_analysis_results.items():
                 signal = self.learning_extractor.extract(
@@ -441,16 +455,14 @@ class StrategicOrchestrator:
                 )
                 learning_signals.append(signal)
 
-            # Aggregate signals (Conservative Merge)
             if learning_signals:
-                # Logic: OR for booleans, Average for bias
                 avoid_risk = any(s.avoid_risk_patterns for s in learning_signals)
                 reduce_expl = any(s.reduce_exploration for s in learning_signals)
                 policy_press = any(s.policy_pressure_high for s in learning_signals)
                 gov_deadlock = any(s.governance_deadlock_detected for s in learning_signals)
                 avg_bias = sum(s.long_term_priority_bias for s in learning_signals) / len(learning_signals)
 
-                aggregated_learning_signal = StrategicLearningSignal(
+                raw_signal = StrategicLearningSignal(
                     avoid_risk_patterns=avoid_risk,
                     reduce_exploration=reduce_expl,
                     policy_pressure_high=policy_press,
@@ -458,15 +470,31 @@ class StrategicOrchestrator:
                     long_term_priority_bias=avg_bias
                 )
 
-            # Apply Learning ONCE
+                is_gov_locked = False
+                if governance_context:
+                    is_gov_locked = governance_context.is_autonomy_locked or governance_context.is_execution_locked
+
+                is_stable = True
+                for key, analysis in context_analysis_results.items():
+                    if analysis["memory_signal"].instability_detected:
+                        is_stable = False
+                        break
+
+                meta_context = MetaLearningContext(
+                    policy=self.meta_learning_policy,
+                    is_governance_locked=is_gov_locked,
+                    is_system_stable=is_stable,
+                    ticks_since_last_failure=self._ticks_since_failure
+                )
+
+                aggregated_learning_signal = self.meta_learning_resolver.resolve(raw_signal, meta_context)
+
             if aggregated_learning_signal:
                 current_posture = human.strategy
                 new_posture = self.learning_policy_adapter.adapt_posture(current_posture, aggregated_learning_signal)
 
                 if new_posture != current_posture:
                     human.strategy = new_posture
-                    # No event emission here per M.6 FIX requirements
-                    # Learning is silent and internal
 
             # 15. Persist Budget
             self._persist_budget(now)

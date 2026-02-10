@@ -13,3 +13,17 @@ class MemoryStore:
 
     def list_all(self) -> List[EventRecord]:
         return list(self._events)
+
+    def clear(self) -> None:
+        """
+        Clears all events from the store.
+        Explicit public API for memory management.
+        """
+        self._events.clear()
+
+    def extend(self, events: List[EventRecord]) -> None:
+        """
+        Appends multiple events to the store.
+        Explicit public API for bulk operations.
+        """
+        self._events.extend(events)
