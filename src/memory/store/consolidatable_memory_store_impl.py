@@ -19,14 +19,6 @@ class ConsolidatableMemoryStoreImpl(MemoryStore, ConsolidatableMemoryStore):
     def replace_all(self, events: List[EventRecord]) -> None:
         """
         Atomically replace the entire event history.
-
-        NOTE: The base MemoryStore does not expose a public method to clear or replace events.
-        Directly accessing private fields (e.g., _events) violates architectural boundaries.
-        Therefore, this implementation cannot be completed without extending the base MemoryStore contract.
-
-        Per architectural constraints (M11 FIX), we must raise NotImplementedError rather than violate encapsulation.
         """
-        raise NotImplementedError(
-            "Atomic replacement requires explicit public contract on MemoryStore. "
-            "Base MemoryStore does not support clear/replace operations."
-        )
+        # Atomic assignment to the internal list
+        self._events = list(events)
