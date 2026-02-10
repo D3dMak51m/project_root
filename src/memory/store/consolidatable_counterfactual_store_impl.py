@@ -3,6 +3,7 @@ from src.memory.store.counterfactual_memory_store import CounterfactualMemorySto
 from src.memory.interfaces.consolidatable_counterfactual_store import ConsolidatableCounterfactualStore
 from src.memory.domain.counterfactual_event import CounterfactualEvent
 
+
 class ConsolidatableCounterfactualStoreImpl(CounterfactualMemoryStore, ConsolidatableCounterfactualStore):
     """
     Opt-in implementation of CounterfactualMemoryStore that supports atomic consolidation.
@@ -18,6 +19,14 @@ class ConsolidatableCounterfactualStoreImpl(CounterfactualMemoryStore, Consolida
     def replace_all(self, events: List[CounterfactualEvent]) -> None:
         """
         Atomically replace the entire counterfactual history.
+
+        NOTE: The base CounterfactualMemoryStore does not expose a public method to clear or replace events.
+        Directly accessing private fields (e.g., _events) violates architectural boundaries.
+        Therefore, this implementation cannot be completed without extending the base store contract.
+
+        Per architectural constraints (M11 FIX), we must raise NotImplementedError rather than violate encapsulation.
         """
-        # Atomic assignment to the internal list
-        self._events = list(events)
+        raise NotImplementedError(
+            "Atomic replacement requires explicit public contract on CounterfactualMemoryStore. "
+            "Base store does not support clear/replace operations."
+        )
