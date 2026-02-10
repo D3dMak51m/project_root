@@ -19,3 +19,17 @@ class CounterfactualMemoryStore:
 
     def list_by_context(self, context_domain: str) -> List[CounterfactualEvent]:
         return [e for e in self._events if e.context_domain == context_domain]
+
+    def clear(self) -> None:
+        """
+        Clears all events from the store.
+        Explicit public API for memory management.
+        """
+        self._events.clear()
+
+    def extend(self, events: List[CounterfactualEvent]) -> None:
+        """
+        Appends multiple events to the store.
+        Explicit public API for bulk operations.
+        """
+        self._events.extend(events)
