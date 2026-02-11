@@ -1,13 +1,13 @@
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import replace
 from datetime import datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
-from governance.runtime.governance_runtime_context import RuntimeGovernanceContext
+from src.governance.runtime.governance_runtime_context import RuntimeGovernanceContext
 from src.core.domain.entity import AIHuman
 from src.core.domain.strategic_context import StrategicContext
 from src.core.domain.execution_intent import ExecutionIntent
-from src.core.domain.resource import StrategicResourceBudget, ResourceCost
+from src.core.domain.resource import StrategicResourceBudget
 from src.core.domain.budget_snapshot import BudgetSnapshot
 from src.core.domain.execution_result import ExecutionResult, ExecutionStatus, ExecutionFailureType
 from src.core.lifecycle.signals import LifeSignals
@@ -26,7 +26,6 @@ from src.core.persistence.strategic_state_backend import StrategicStateBackend
 from src.core.persistence.budget_backend import BudgetPersistenceBackend, InMemoryBudgetBackend
 from src.core.replay.budget_reducer import BudgetReplayReducer
 from src.core.interfaces.execution_adapter import ExecutionAdapter
-from src.infrastructure.adapters.mock_execution_adapter import MockExecutionAdapter
 from src.core.replay.strategic_replay_engine import StrategicReplayEngine
 from src.core.observability.strategic_observer import StrategicObserver
 from src.core.observability.null_observer import NullStrategicObserver
@@ -66,8 +65,10 @@ from src.memory.domain.meta_learning_policy import MetaLearningPolicy
 from src.memory.domain.meta_learning_context import MetaLearningContext
 from src.memory.services.meta_learning_resolver import MetaLearningResolver
 from src.infrastructure.services.telegram_persona_projection import TelegramPersonaProjectionService
-from world.context.context_buffer import ContextBuffer
-from world.store.world_observation_store import WorldObservationStore
+from src.execution.domain.execution_job import ExecutionJob
+from src.execution.queue.execution_queue import ExecutionQueue, InMemoryExecutionQueue
+from src.world.context.context_buffer import ContextBuffer
+from src.world.store.world_observation_store import WorldObservationStore
 
 
 class StrategicOrchestrator:
@@ -91,6 +92,8 @@ class StrategicOrchestrator:
             budget_backend: Optional[BudgetPersistenceBackend] = None,
             budget_ledger: Optional[BudgetLedger] = None,
             adapter_registry: Optional[ExecutionAdapterRegistry] = None,
+            execution_adapter: Optional[ExecutionAdapter] = None,
+            execution_queue: Optional[ExecutionQueue] = None,
             observer: Optional[StrategicObserver] = None,
             governance_service: Optional[GovernanceService] = None,
             memory_store: Optional[MemoryStore] = None,
@@ -121,7 +124,10 @@ class StrategicOrchestrator:
         self.budget_ledger = budget_ledger or InMemoryBudgetLedger()
         self.budget_reducer = BudgetReplayReducer()
         self.adapter_registry = adapter_registry or ExecutionAdapterRegistry()
+        self.execution_queue = execution_queue or InMemoryExecutionQueue()
         self.observer = observer or NullStrategicObserver()
+        if execution_adapter is not None:
+            self.adapter_registry.register("default", execution_adapter)
         self.governance_service = governance_service
         self.governance_provider = GovernanceRuntimeProvider(
             self.governance_service) if self.governance_service else None
@@ -154,7 +160,10 @@ class StrategicOrchestrator:
 
         self._runtimes: Dict[str, StrategicContextRuntime] = {}
         self._last_executed_intent: Optional[ExecutionIntent] = None
-        self._last_execution_result: Optional[ExecutionResult] = None
+        self._pending_feedback_by_context: Dict[str, List[ExecutionResult]] = {}
+        self._pending_execution_meta: Dict[UUID, Dict[str, Any]] = {}
+        self._panic_mode: bool = False
+        self._disabled_platforms: set[str] = set()
 
         # Initialize Budget (Event Sourced)
         self._budget = self._restore_budget()
@@ -266,6 +275,103 @@ class StrategicOrchestrator:
     def set_phase(self, phase: RuntimePhase) -> None:
         self.runtime_phase = phase
 
+    def set_panic_mode(self, enabled: bool) -> None:
+        self._panic_mode = enabled
+
+    def set_platform_enabled(self, platform: str, enabled: bool) -> None:
+        if enabled:
+            self._disabled_platforms.discard(platform)
+        else:
+            self._disabled_platforms.add(platform)
+
+    def post_execution_pipeline(self, envelope: Dict[str, Any]) -> None:
+        now = self.time_source.now()
+        intent_id = envelope.get("intent_id")
+        context_domain = envelope.get("context_domain")
+        reservation_delta = dict(envelope.get("reservation_delta") or {})
+        result = envelope.get("result")
+        intent = envelope.get("intent")
+
+        meta: Optional[Dict[str, Any]] = None
+        if intent_id:
+            meta = self._pending_execution_meta.pop(intent_id, None)
+        if meta:
+            if not context_domain:
+                context_domain = meta.get("context_domain")
+            if not reservation_delta:
+                reservation_delta = dict(meta.get("reservation_delta") or {})
+            if intent is None:
+                intent = meta.get("intent")
+
+        if not isinstance(result, ExecutionResult):
+            return
+
+        if context_domain:
+            self._pending_feedback_by_context.setdefault(context_domain, []).append(result)
+
+        if reservation_delta and result.status in (ExecutionStatus.FAILED, ExecutionStatus.REJECTED):
+            rollback_delta = {k: -v for k, v in reservation_delta.items()}
+            self._emit_budget_event(
+                "BUDGET_ROLLED_BACK",
+                rollback_delta,
+                f"Rollback for {intent_id}: {result.status.name}",
+                now,
+            )
+
+        self.observer.on_execution_result(result, is_replay=False)
+        if intent and context_domain:
+            self._emit_execution_telemetry(intent, result, context_domain, now, is_replay=False)
+
+        if intent and context_domain:
+            governance_context = meta.get("governance_context") if meta else None
+            gov_snapshot = (
+                GovernanceSnapshot.from_context(governance_context)
+                if governance_context
+                else GovernanceSnapshot.empty()
+            )
+            captured_autonomy = AutonomyState(AutonomyMode.SILENT, "No winner", 0.0, [], False)
+            captured_policy = PolicyDecision(False, "No winner", [])
+            event_record = EventRecord(
+                id=self.memory_id_source.new_id(),
+                intent_id=intent.id,
+                execution_status=result.status,
+                execution_result=result,
+                autonomy_state_before=captured_autonomy,
+                policy_decision=captured_policy,
+                governance_snapshot=gov_snapshot,
+                issued_at=now,
+                context_domain=context_domain,
+            )
+            self.memory_ingestion.ingest(event_record)
+
+        self._persist_budget(now)
+
+    def _pop_context_feedback(
+            self,
+            context_domain: str,
+            fallback_feedback: Optional[ExecutionResult],
+    ) -> Optional[ExecutionResult]:
+        queued = self._pending_feedback_by_context.get(context_domain)
+        if queued:
+            result = queued.pop(0)
+            if not queued:
+                self._pending_feedback_by_context.pop(context_domain, None)
+            if result.status in (ExecutionStatus.FAILED, ExecutionStatus.REJECTED):
+                self._ticks_since_failure = 0
+            else:
+                self._ticks_since_failure += 1
+            return result
+
+        if fallback_feedback:
+            if fallback_feedback.status in (ExecutionStatus.FAILED, ExecutionStatus.REJECTED):
+                self._ticks_since_failure = 0
+            else:
+                self._ticks_since_failure += 1
+            return fallback_feedback
+
+        self._ticks_since_failure += 1
+        return None
+
     def tick(self, human: AIHuman, signals: LifeSignals) -> Optional[ExecutionIntent]:
         now = self.time_source.now()
         is_replay = (self.runtime_phase == RuntimePhase.REPLAY)
@@ -287,22 +393,7 @@ class StrategicOrchestrator:
             if any(v > 0 for v in recovery_delta.values()):
                 self._emit_budget_event("BUDGET_RECOVERED", recovery_delta, "Time-based recovery", now)
 
-            # 2. Inject Feedback
-            effective_execution_feedback = signals.execution_feedback
-            if self._last_execution_result:
-                effective_execution_feedback = self._last_execution_result
-                self._last_execution_result = None
-
-            # Update failure tracker
-            if effective_execution_feedback:
-                if effective_execution_feedback.status in (ExecutionStatus.FAILED, ExecutionStatus.REJECTED):
-                    self._ticks_since_failure = 0
-                else:
-                    self._ticks_since_failure += 1
-            else:
-                self._ticks_since_failure += 1
-
-            # 3. Route Signals
+            # 2. Route Signals
             available_contexts = [r.context for r in self._runtimes.values() if r.active]
             target_contexts = self.routing_policy.resolve(signals, available_contexts)
 
@@ -311,7 +402,7 @@ class StrategicOrchestrator:
 
             context_analysis_results = {}
 
-            # 4. Tick LifeLoops & Analyze Memory
+            # 3. Tick LifeLoops & Analyze Memory
             for context in target_contexts:
                 key = str(context)
                 runtime = self._runtimes.get(key)
@@ -346,11 +437,15 @@ class StrategicOrchestrator:
 
                 # C. Tick LifeLoop
                 runtime.tick_count += 1
+                context_feedback = self._pop_context_feedback(
+                    context_domain=context.domain,
+                    fallback_feedback=signals.execution_feedback,
+                )
                 scoped_signals = self._build_scoped_signals(
                     base_signals=signals,
                     observations=new_observations,
                     context_domain=context.domain,
-                    execution_feedback=effective_execution_feedback
+                    execution_feedback=context_feedback
                 )
                 internal_context = runtime.lifeloop.tick(
                     human=runtime_human,
@@ -384,7 +479,7 @@ class StrategicOrchestrator:
                             self._record_counterfactual(intent, "Budget Insufficient", "Budget", governance_context,
                                                         context, now)
 
-            # 5. Arbitrate
+            # 4. Arbitrate
             winner_intent: Optional[ExecutionIntent] = None
             winner_runtime: Optional[StrategicContextRuntime] = None
 
@@ -392,8 +487,9 @@ class StrategicOrchestrator:
                 winner = self.arbitrator.select(candidates)
                 if winner:
                     winner_runtime, winner_intent = winner
+                    winner_human = winner_runtime.human or human
 
-                    # 7. Governance Execution Gate
+                    # 5. Governance Execution Gate
                     if governance_context:
                         gate_decision = ExecutionGateDecision.ALLOW
                         final_gate = self.governance_execution_resolver.apply(gate_decision, governance_context)
@@ -405,73 +501,93 @@ class StrategicOrchestrator:
                             winner_runtime = None
 
                     if winner_intent:
-                        # 8. Reserve Budget
+                        # 6. Reserve Budget
                         if winner_intent.estimated_cost:
                             reservation_delta = self.resource_manager.calculate_reservation_delta(
                                 winner_intent.estimated_cost)
                             self._emit_budget_event("BUDGET_RESERVED", reservation_delta,
                                                     f"Reservation for {winner_intent.id}", now)
-                            winner_human = winner_runtime.human or human
                             winner_intent, projection_error = self._project_intent_with_persona(
                                 winner_intent, winner_human
                             )
                             self._last_executed_intent = winner_intent
+                            winner_priority = 0.0
+                            for runtime_candidate, intent_candidate, priority_candidate in candidates:
+                                if runtime_candidate == winner_runtime and intent_candidate.id == winner_intent.id:
+                                    winner_priority = priority_candidate
+                                    break
 
-                            # 9. Execute (External)
-                            if self.profile.allow_execution and self.runtime_phase != RuntimePhase.REPLAY:
-                                if projection_error:
-                                    execution_result = ResultNormalizer.failure(
-                                        reason=f"Persona projection failed: {projection_error}",
-                                        failure_type=ExecutionFailureType.INTERNAL
+                            if projection_error:
+                                self.post_execution_pipeline(
+                                    {
+                                        "intent_id": winner_intent.id,
+                                        "intent": winner_intent,
+                                        "context_domain": winner_runtime.context.domain,
+                                        "reservation_delta": reservation_delta,
+                                        "result": ResultNormalizer.failure(
+                                            reason=f"Persona projection failed: {projection_error}",
+                                            failure_type=ExecutionFailureType.INTERNAL,
+                                        ),
+                                    }
+                                )
+                            elif self.runtime_phase == RuntimePhase.REPLAY or not self.profile.allow_execution:
+                                self.post_execution_pipeline(
+                                    {
+                                        "intent_id": winner_intent.id,
+                                        "intent": winner_intent,
+                                        "context_domain": winner_runtime.context.domain,
+                                        "reservation_delta": reservation_delta,
+                                        "result": ResultNormalizer.rejection(
+                                            reason="Execution disabled by runtime profile"
+                                        ),
+                                    }
+                                )
+                            elif self._panic_mode:
+                                self.post_execution_pipeline(
+                                    {
+                                        "intent_id": winner_intent.id,
+                                        "intent": winner_intent,
+                                        "context_domain": winner_runtime.context.domain,
+                                        "reservation_delta": reservation_delta,
+                                        "result": ResultNormalizer.rejection(
+                                            reason="Execution blocked by panic mode"
+                                        ),
+                                    }
+                                )
+                            else:
+                                platform = str(winner_intent.constraints.get("platform", "default"))
+                                if platform in self._disabled_platforms:
+                                    self.post_execution_pipeline(
+                                        {
+                                            "intent_id": winner_intent.id,
+                                            "intent": winner_intent,
+                                            "context_domain": winner_runtime.context.domain,
+                                            "reservation_delta": reservation_delta,
+                                            "result": ResultNormalizer.rejection(
+                                                reason=f"Execution blocked: platform '{platform}' disabled"
+                                            ),
+                                        }
                                     )
                                 else:
-                                    execution_result = self.adapter_registry.execute_safe(winner_intent)
-                                self._last_execution_result = execution_result
-
-                                self.observer.on_execution_result(execution_result, is_replay=False)
-                                self._emit_execution_telemetry(
-                                    winner_intent,
-                                    execution_result,
-                                    winner_runtime.context,
-                                    now,
-                                    is_replay=False
-                                )
-
-                                # 10. Commit/Rollback Budget
-                                if execution_result.status in (ExecutionStatus.FAILED, ExecutionStatus.REJECTED):
-                                    rollback_delta = {k: -v for k, v in reservation_delta.items()}
-                                    self._emit_budget_event("BUDGET_ROLLED_BACK", rollback_delta,
-                                                            f"Rollback for {winner_intent.id}: {execution_result.status.name}",
-                                                            now)
-                            else:
-                                execution_result = None
-                                pass
-
-                            # 11. Memory Ingestion
-                            if execution_result:
-                                gov_snapshot = GovernanceSnapshot.from_context(
-                                    governance_context) if governance_context else GovernanceSnapshot.empty()
-                                captured_autonomy = AutonomyState(AutonomyMode.SILENT, "No winner", 0.0, [], False)
-                                captured_policy = PolicyDecision(False, "No winner", [])
-
-                                event_record = EventRecord(
-                                    id=self.memory_id_source.new_id(),
-                                    intent_id=winner_intent.id,
-                                    execution_status=execution_result.status,
-                                    execution_result=execution_result,
-                                    autonomy_state_before=captured_autonomy,
-                                    policy_decision=captured_policy,
-                                    governance_snapshot=gov_snapshot,
-                                    issued_at=now,
-                                    context_domain=winner_runtime.context.domain
-                                )
-                                self.memory_ingestion.ingest(event_record)
+                                    job = ExecutionJob.new(
+                                        intent=winner_intent,
+                                        context_domain=winner_runtime.context.domain,
+                                        reservation_delta=reservation_delta,
+                                        priority=winner_priority,
+                                    )
+                                    self.execution_queue.enqueue(job)
+                                    self._pending_execution_meta[winner_intent.id] = {
+                                        "intent": winner_intent,
+                                        "context_domain": winner_runtime.context.domain,
+                                        "reservation_delta": reservation_delta,
+                                        "governance_context": governance_context,
+                                    }
 
                         else:
                             winner_intent = None
                             winner_runtime = None
 
-            # 12. Suppress Losers
+            # 7. Suppress Losers
             for runtime, intent, _ in candidates:
                 if runtime != winner_runtime:
                     loser_human = runtime.human or human
@@ -479,7 +595,7 @@ class StrategicOrchestrator:
                     self._record_counterfactual(intent, "Lost Arbitration", "Arbitration", governance_context,
                                                 runtime.context, now)
 
-            # 13. Update Starvation
+            # 8. Update Starvation
             for key, runtime in self._runtimes.items():
                 if not runtime.active: continue
                 is_winner = (runtime == winner_runtime)
@@ -487,7 +603,7 @@ class StrategicOrchestrator:
                 runtime.starvation_score = self.priority_service.update_starvation(runtime, is_winner, has_intent)
                 if is_winner: runtime.last_win_tick = runtime.tick_count
 
-            # 14. Strategic Learning Loop (Post-Execution)
+            # 9. Strategic Learning Loop (Post-Execution)
             aggregated_learning_signal = None
 
             learning_signals = []
@@ -541,7 +657,7 @@ class StrategicOrchestrator:
                     human.strategy = new_posture
                     # No event emission here per M.6 FIX requirements
 
-            # 15. Persist Budget
+            # 10. Persist Budget
             self._persist_budget(now)
 
             self.observer.on_telemetry(TelemetryEvent(now, "TICK_END", "Orchestrator", payload={
@@ -624,7 +740,7 @@ class StrategicOrchestrator:
             self,
             intent: ExecutionIntent,
             result: ExecutionResult,
-            context: StrategicContext,
+            context_domain: str,
             now: datetime,
             is_replay: bool
     ) -> None:
@@ -637,7 +753,7 @@ class StrategicOrchestrator:
                 timestamp=now,
                 event_type="TELEGRAM_MESSAGE_SENT",
                 source_component="Orchestrator",
-                context_id=context.domain,
+                context_id=context_domain,
                 payload={
                     "intent_id": str(intent.id),
                     "message_id": result.observations.get("message_id")
@@ -651,7 +767,7 @@ class StrategicOrchestrator:
                 timestamp=now,
                 event_type="TELEGRAM_MESSAGE_FAILED",
                 source_component="Orchestrator",
-                context_id=context.domain,
+                context_id=context_domain,
                 payload={
                     "intent_id": str(intent.id),
                     "status": result.status.value,
