@@ -13,6 +13,7 @@ from src.integration.normalizer import ResultNormalizer
 from src.memory.store.counterfactual_memory_store import CounterfactualMemoryStore
 from src.memory.store.memory_store import MemoryStore
 from src.world.store.world_observation_store import WorldObservationStore
+from src.hierarchy.domain.hierarchy_models import HierarchyDirective, HierarchyLevel
 
 
 class AdminControlPlaneService:
@@ -24,6 +25,9 @@ class AdminControlPlaneService:
         memory_store: MemoryStore,
         counterfactual_store: CounterfactualMemoryStore,
         mutation_audit_store: Optional[MutationAuditStore] = None,
+        hierarchy_projection_service: Optional[Any] = None,
+        hierarchy_override_store: Optional[Any] = None,
+        upward_aggregation_service: Optional[Any] = None,
     ):
         self.orchestrator = orchestrator
         self.execution_queue = execution_queue
@@ -31,6 +35,9 @@ class AdminControlPlaneService:
         self.memory_store = memory_store
         self.counterfactual_store = counterfactual_store
         self.mutation_audit_store = mutation_audit_store or MutationAuditStore()
+        self.hierarchy_projection_service = hierarchy_projection_service
+        self.hierarchy_override_store = hierarchy_override_store
+        self.upward_aggregation_service = upward_aggregation_service
         self._global_pause = False
         self._panic_mode = False
         self._disabled_contexts: set[str] = set()
@@ -273,6 +280,87 @@ class AdminControlPlaneService:
     def get_mutation_audit(self, limit: int = 200) -> List[AdminMutationAudit]:
         return self.mutation_audit_store.list_recent(limit=limit)
 
+    def get_hierarchy_tree(self) -> Dict[str, Any]:
+        if not self.hierarchy_projection_service:
+            return {"nodes": [], "edges": [], "directives": []}
+        graph = self.hierarchy_projection_service.build_graph()
+        return {
+            "nodes": [
+                {
+                    "id": node.id,
+                    "name": node.name,
+                    "level": node.level.value,
+                    "parent_id": node.parent_id,
+                    "metadata": dict(node.metadata),
+                }
+                for node in graph.nodes
+            ],
+            "edges": [{"parent_id": edge.parent_id, "child_id": edge.child_id} for edge in graph.edges],
+            "directives": [self._directive_summary(d) for d in graph.directives],
+        }
+
+    def get_hierarchy_aggregates(self, level: Optional[str] = None, limit: int = 200) -> List[Dict[str, Any]]:
+        if not self.upward_aggregation_service:
+            return []
+        parsed_level: Optional[HierarchyLevel] = None
+        if level:
+            parsed_level = HierarchyLevel(str(level).upper())
+        rows = self.upward_aggregation_service.list_aggregates(level=parsed_level, limit=limit)
+        return [
+            {
+                "bucket_at": row.bucket_at,
+                "level": row.level.value,
+                "key": row.key,
+                "metrics": dict(row.metrics),
+            }
+            for row in rows
+        ]
+
+    def create_hierarchy_override(
+        self,
+        level: str,
+        target: str,
+        payload: Dict[str, Any],
+        actor: str,
+        role: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not self.hierarchy_override_store:
+            return None
+        override_id = self.hierarchy_override_store.create_override(
+            level=level,
+            target=target,
+            payload=payload,
+            actor=actor,
+        )
+        created = self.hierarchy_override_store.get(override_id)
+        self._audit(
+            actor=actor,
+            role=role,
+            action="hierarchy_override_create",
+            target=str(override_id),
+            before={},
+            after=self._directive_summary(created) if created else {},
+            metadata={"level": level, "target": target},
+        )
+        return self._directive_summary(created) if created else None
+
+    def delete_hierarchy_override(self, override_id: UUID, actor: str, role: str) -> bool:
+        if not self.hierarchy_override_store:
+            return False
+        before = self.hierarchy_override_store.get(override_id)
+        ok = self.hierarchy_override_store.deactivate_override(override_id)
+        if ok:
+            after = self.hierarchy_override_store.get(override_id)
+            self._audit(
+                actor=actor,
+                role=role,
+                action="hierarchy_override_delete",
+                target=str(override_id),
+                before=self._directive_summary(before) if before else {},
+                after=self._directive_summary(after) if after else {},
+            )
+        return ok
+
     def _world_by_context(self, context_domain: str, limit: int) -> List[Any]:
         if hasattr(self.world_store, "list_by_context"):
             return self.world_store.list_by_context(context_domain, limit=limit)
@@ -293,6 +381,24 @@ class AdminControlPlaneService:
             "job_version": job.job_version,
             "parent_job_id": str(job.parent_job_id) if job.parent_job_id else None,
             "last_error": job.last_error,
+        }
+
+    def _directive_summary(self, directive: Optional[HierarchyDirective]) -> Dict[str, Any]:
+        if not directive:
+            return {}
+        return {
+            "id": str(directive.id),
+            "level": directive.level.value,
+            "target": directive.target,
+            "reason": directive.reason,
+            "execution_locked": directive.execution_locked,
+            "autonomy_locked": directive.autonomy_locked,
+            "override_mode": directive.override_mode,
+            "policy_constraints": list(directive.policy_constraints),
+            "budget_cap": directive.budget_cap,
+            "priority_bias": directive.priority_bias,
+            "metadata": dict(directive.metadata),
+            "created_at": directive.created_at,
         }
 
     def _audit(

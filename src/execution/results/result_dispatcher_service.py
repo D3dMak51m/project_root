@@ -2,9 +2,10 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 from src.execution.results.execution_result_inbox import ExecutionResultInbox
+from src.execution.logging.structured_runtime_logger import StructuredRuntimeLogger
 
 
 @dataclass(frozen=True)
@@ -28,10 +29,12 @@ class ResultDispatcherService:
         config: ResultDispatcherConfig,
         inbox: ExecutionResultInbox,
         apply_result: Callable[[dict], None],
+        structured_logger: Optional[StructuredRuntimeLogger] = None,
     ):
         self.config = config
         self.inbox = inbox
         self.apply_result = apply_result
+        self.structured_logger = structured_logger
         self._notify_event = threading.Event()
         self._stop_event = threading.Event()
         self._sla_violations: List[float] = []
@@ -73,4 +76,26 @@ class ResultDispatcherService:
         latency_ms = (now - envelope["received_at"]).total_seconds() * 1000.0
         if latency_ms > self.config.result_apply_sla_ms:
             self._sla_violations.append(latency_ms)
+            self._log(
+                "DISPATCHER_SLA_VIOLATION",
+                dispatcher_id=self.config.dispatcher_id,
+                job_id=str(envelope.get("job_id")),
+                intent_id=str(envelope.get("intent_id")),
+                context_domain=envelope.get("context_domain"),
+                latency_ms=latency_ms,
+            )
+        else:
+            self._log(
+                "DISPATCHER_APPLY",
+                dispatcher_id=self.config.dispatcher_id,
+                job_id=str(envelope.get("job_id")),
+                intent_id=str(envelope.get("intent_id")),
+                context_domain=envelope.get("context_domain"),
+                latency_ms=latency_ms,
+            )
         self.apply_result(envelope)
+
+    def _log(self, event_type: str, **fields) -> None:
+        if not self.structured_logger:
+            return
+        self.structured_logger.emit(event_type=event_type, **fields)

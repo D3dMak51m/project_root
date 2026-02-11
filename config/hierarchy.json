@@ -1,0 +1,52 @@
+{
+  "nodes": [
+    {
+      "id": "global",
+      "level": "L0",
+      "name": "Global"
+    },
+    {
+      "id": "telegram-state",
+      "level": "L1",
+      "name": "Telegram State",
+      "parent_id": "global"
+    },
+    {
+      "id": "telegram-region",
+      "level": "L2",
+      "name": "Telegram Region",
+      "parent_id": "telegram-state"
+    }
+  ],
+  "edges": [
+    {
+      "parent_id": "global",
+      "child_id": "telegram-state"
+    },
+    {
+      "parent_id": "telegram-state",
+      "child_id": "telegram-region"
+    }
+  ],
+  "directives": [
+    {
+      "id": "00000000-0000-0000-0000-000000000001",
+      "level": "L0",
+      "target": "*",
+      "reason": "Global defaults",
+      "execution_locked": false,
+      "autonomy_locked": false,
+      "policy_constraints": []
+    },
+    {
+      "id": "00000000-0000-0000-0000-000000000002",
+      "level": "L2",
+      "target": "telegram:*",
+      "reason": "Telegram platform policy",
+      "policy_constraints": [
+        "NO_SPAM"
+      ]
+    }
+  ]
+}
+

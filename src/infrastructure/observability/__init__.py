@@ -1,0 +1,2 @@
+"""Infrastructure telemetry hooks."""
+

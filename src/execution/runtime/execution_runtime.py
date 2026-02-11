@@ -2,8 +2,11 @@ import threading
 from dataclasses import dataclass
 from typing import Optional
 
+from src.content.services.content_generation_service import ContentGenerationService
 from src.core.orchestration.strategic_orchestrator import StrategicOrchestrator
 from src.execution.idempotency.idempotency_store import IdempotencyStore, InMemoryIdempotencyStore
+from src.execution.logging.structured_runtime_logger import StructuredRuntimeLogger
+from src.execution.limits.adaptive_rate_controller import AdaptiveRateController
 from src.execution.limits.rate_limiter import InMemorySlidingRateLimiter
 from src.execution.queue.execution_queue import ExecutionQueue
 from src.execution.results.execution_result_inbox import (
@@ -20,6 +23,7 @@ from src.execution.safety.postgres_safety_store import PostgresExecutionSafetySt
 from src.execution.worker.execution_worker import ExecutionWorker, ExecutionWorkerConfig
 from src.execution.worker.worker_heartbeat import InMemoryWorkerHeartbeatStore, WorkerHeartbeatStore
 from src.execution.worker.worker_supervisor import WorkerSupervisor
+from src.infrastructure.observability.anomaly_hook import AnomalyHook, NoopAnomalyHook
 from src.integration.registry import ExecutionAdapterRegistry
 
 
@@ -56,6 +60,10 @@ class ExecutionRuntime:
         idempotency_store: Optional[IdempotencyStore] = None,
         heartbeat_store: Optional[WorkerHeartbeatStore] = None,
         safety_store: Optional[PostgresExecutionSafetyStore] = None,
+        content_generation_service: Optional[ContentGenerationService] = None,
+        adaptive_rate_controller: Optional[AdaptiveRateController] = None,
+        anomaly_hook: Optional[AnomalyHook] = None,
+        structured_logger: Optional[StructuredRuntimeLogger] = None,
     ):
         self.orchestrator = orchestrator
         self.adapter_registry = adapter_registry
@@ -68,6 +76,10 @@ class ExecutionRuntime:
         self.idempotency_store = idempotency_store or InMemoryIdempotencyStore()
         self.heartbeat_store = heartbeat_store or InMemoryWorkerHeartbeatStore()
         self.safety_store = safety_store
+        self.content_generation_service = content_generation_service
+        self.adaptive_rate_controller = adaptive_rate_controller or AdaptiveRateController()
+        self.anomaly_hook = anomaly_hook or NoopAnomalyHook()
+        self.structured_logger = structured_logger
 
         self.dispatcher = ResultDispatcherService(
             config=ResultDispatcherConfig(
@@ -79,6 +91,7 @@ class ExecutionRuntime:
             ),
             inbox=self.inbox,
             apply_result=self.orchestrator.post_execution_pipeline,
+            structured_logger=self.structured_logger,
         )
 
         self._dispatcher_thread: Optional[threading.Thread] = None
@@ -106,6 +119,10 @@ class ExecutionRuntime:
                 heartbeat_store=self.heartbeat_store,
                 push_notify=self.dispatcher.notify,
                 on_circuit_transition=self.safety_store.record_transition if self.safety_store else None,
+                content_generation_service=self.content_generation_service,
+                adaptive_rate_controller=self.adaptive_rate_controller,
+                anomaly_hook=self.anomaly_hook,
+                structured_logger=self.structured_logger,
             )
             workers.append(worker)
         return workers
@@ -121,6 +138,9 @@ class ExecutionRuntime:
             self.supervisor.start_watchdog(self.config.watchdog_interval_seconds)
         if self.safety_store:
             self.safety_store.record_rate_limit_snapshot(self.rate_limiter.snapshot())
+            self.safety_store.record_rate_limit_snapshot(
+                {f"adaptive:{k}": v for k, v in self.adaptive_rate_controller.snapshot().items()}
+            )
 
     def stop(self) -> None:
         if not self._started:
@@ -131,4 +151,7 @@ class ExecutionRuntime:
             self._dispatcher_thread.join(timeout=2.0)
         if self.safety_store:
             self.safety_store.record_rate_limit_snapshot(self.rate_limiter.snapshot())
+            self.safety_store.record_rate_limit_snapshot(
+                {f"adaptive:{k}": v for k, v in self.adaptive_rate_controller.snapshot().items()}
+            )
         self._started = False

@@ -57,6 +57,48 @@ def build_admin_router(
     def get_budget(limit: int = 100, claims=Depends(_claims("viewer"))):
         return service.get_budget_view(limit=limit)
 
+    @router.get("/hierarchy/tree")
+    def get_hierarchy_tree(claims=Depends(_claims("viewer"))):
+        return service.get_hierarchy_tree()
+
+    @router.get("/hierarchy/aggregates")
+    def get_hierarchy_aggregates(
+        level: Optional[str] = None,
+        limit: int = 200,
+        claims=Depends(_claims("viewer")),
+    ):
+        try:
+            return {"items": service.get_hierarchy_aggregates(level=level, limit=limit)}
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid hierarchy level")
+
+    @router.post("/hierarchy/override")
+    def create_hierarchy_override(payload: Dict[str, Any], claims=Depends(_claims("admin"))):
+        level = str(payload.get("level", "L2")).upper()
+        target = str(payload.get("target", "*"))
+        body = dict(payload.get("payload") or {})
+        created = service.create_hierarchy_override(
+            level=level,
+            target=target,
+            payload=body,
+            actor=claims.sub,
+            role=_actor_role(claims, "admin"),
+        )
+        if not created:
+            raise HTTPException(status_code=503, detail="Hierarchy overrides unavailable")
+        return created
+
+    @router.delete("/hierarchy/override/{override_id}")
+    def delete_hierarchy_override(override_id: UUID, claims=Depends(_claims("admin"))):
+        ok = service.delete_hierarchy_override(
+            override_id=override_id,
+            actor=claims.sub,
+            role=_actor_role(claims, "admin"),
+        )
+        if not ok:
+            raise HTTPException(status_code=404, detail="Override not found")
+        return {"status": "ok", "override_id": str(override_id)}
+
     @router.get("/dlq")
     def get_dlq(limit: int = 100, claims=Depends(_claims("viewer"))):
         return {"items": service.list_dlq(limit=limit)}

@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Callable
 from dataclasses import replace
 from datetime import datetime
 from uuid import UUID, uuid4
@@ -110,7 +110,9 @@ class StrategicOrchestrator:
             meta_learning_policy: Optional[MetaLearningPolicy] = None,
             persona_projection_service: Optional[TelegramPersonaProjectionService] = None,
             context_buffer: Optional[ContextBuffer] = None,
-            world_store: Optional[WorldObservationStore] = None
+            world_store: Optional[WorldObservationStore] = None,
+            governance_context_resolver: Optional[Callable[[StrategicContext, AIHuman], Any]] = None,
+            upward_aggregation_service: Optional[Any] = None,
     ):
         self.time_source = time_source
         self.ledger = ledger
@@ -131,6 +133,7 @@ class StrategicOrchestrator:
         self.governance_service = governance_service
         self.governance_provider = GovernanceRuntimeProvider(
             self.governance_service) if self.governance_service else None
+        self.governance_context_resolver = governance_context_resolver
 
         self.governance_execution_resolver = StandardGovernanceExecutionResolver()
         self.governance_autonomy_resolver = StandardGovernanceAutonomyResolver()
@@ -155,6 +158,7 @@ class StrategicOrchestrator:
         self.meta_learning_resolver = meta_learning_resolver or MetaLearningResolver()
         self.meta_learning_policy = meta_learning_policy or MetaLearningPolicy.default()
         self.persona_projection_service = persona_projection_service or TelegramPersonaProjectionService()
+        self.upward_aggregation_service = upward_aggregation_service
 
         self._ticks_since_failure = 100
 
@@ -344,6 +348,27 @@ class StrategicOrchestrator:
             )
             self.memory_ingestion.ingest(event_record)
 
+        if self.upward_aggregation_service and context_domain:
+            try:
+                queue_lag = 0.0
+                if hasattr(self.execution_queue, "depth_by_context"):
+                    queue_lag = float(self.execution_queue.depth_by_context().get(context_domain, 0))
+                self.upward_aggregation_service.record_execution(
+                    context_domain=context_domain,
+                    result=result,
+                    reservation_delta=reservation_delta,
+                    queue_lag=queue_lag,
+                )
+            except Exception as exc:
+                self.observer.on_telemetry(
+                    TelemetryEvent(
+                        now,
+                        "HIERARCHY_AGGREGATION_ERROR",
+                        "Orchestrator",
+                        payload={"error": str(exc), "context_domain": context_domain},
+                    )
+                )
+
         self._persist_budget(now)
 
     def _pop_context_feedback(
@@ -379,10 +404,8 @@ class StrategicOrchestrator:
         self.observer.on_telemetry(TelemetryEvent(now, "TICK_START", "Orchestrator", is_replay=is_replay))
 
         try:
-            # 0. Fetch Governance Context
-            governance_context = None
-            if self.governance_provider:
-                governance_context = self.governance_provider.get_context()
+            # 0. Context-scoped Governance Context
+            governance_context_by_context: Dict[str, Optional[RuntimeGovernanceContext]] = {}
 
             # 0.1 Ingest Buffered Observations [NEW]
             # Pull observations from buffer; each context receives only its scoped subset.
@@ -409,6 +432,8 @@ class StrategicOrchestrator:
                 if not runtime:
                     continue
                 runtime_human = runtime.human or human
+                runtime_governance_context = self._resolve_governance_context(context, runtime_human)
+                governance_context_by_context[key] = runtime_governance_context
 
                 if runtime.tick_count >= self.profile.limits.max_ticks:
                     if self.profile.fail_fast:
@@ -463,7 +488,7 @@ class StrategicOrchestrator:
                         if memory_context.cooldown_required:
                             if intent.risk_level > 0.1:
                                 runtime.lifeloop.suppress_pending_intentions(runtime_human)
-                                self._record_counterfactual(intent, "Memory Cooldown", "Memory", governance_context,
+                                self._record_counterfactual(intent, "Memory Cooldown", "Memory", runtime_governance_context,
                                                             context, now)
                                 continue
 
@@ -476,7 +501,7 @@ class StrategicOrchestrator:
                             runtimes_with_intent.add(key)
                         else:
                             runtime.lifeloop.suppress_pending_intentions(runtime_human)
-                            self._record_counterfactual(intent, "Budget Insufficient", "Budget", governance_context,
+                            self._record_counterfactual(intent, "Budget Insufficient", "Budget", runtime_governance_context,
                                                         context, now)
 
             # 4. Arbitrate
@@ -488,15 +513,16 @@ class StrategicOrchestrator:
                 if winner:
                     winner_runtime, winner_intent = winner
                     winner_human = winner_runtime.human or human
+                    winner_governance_context = governance_context_by_context.get(str(winner_runtime.context))
 
                     # 5. Governance Execution Gate
-                    if governance_context:
+                    if winner_governance_context:
                         gate_decision = ExecutionGateDecision.ALLOW
-                        final_gate = self.governance_execution_resolver.apply(gate_decision, governance_context)
+                        final_gate = self.governance_execution_resolver.apply(gate_decision, winner_governance_context)
 
                         if final_gate == ExecutionGateDecision.DENY:
                             self._record_counterfactual(winner_intent, "Governance Execution Gate", "Governance",
-                                                        governance_context, winner_runtime.context, now)
+                                                        winner_governance_context, winner_runtime.context, now)
                             winner_intent = None
                             winner_runtime = None
 
@@ -580,7 +606,7 @@ class StrategicOrchestrator:
                                         "intent": winner_intent,
                                         "context_domain": winner_runtime.context.domain,
                                         "reservation_delta": reservation_delta,
-                                        "governance_context": governance_context,
+                                        "governance_context": winner_governance_context,
                                     }
 
                         else:
@@ -592,7 +618,8 @@ class StrategicOrchestrator:
                 if runtime != winner_runtime:
                     loser_human = runtime.human or human
                     runtime.lifeloop.suppress_pending_intentions(loser_human)
-                    self._record_counterfactual(intent, "Lost Arbitration", "Arbitration", governance_context,
+                    loser_governance_context = governance_context_by_context.get(str(runtime.context))
+                    self._record_counterfactual(intent, "Lost Arbitration", "Arbitration", loser_governance_context,
                                                 runtime.context, now)
 
             # 8. Update Starvation
@@ -630,9 +657,10 @@ class StrategicOrchestrator:
                     long_term_priority_bias=avg_bias
                 )
 
-                is_gov_locked = False
-                if governance_context:
-                    is_gov_locked = governance_context.is_autonomy_locked or governance_context.is_execution_locked
+                is_gov_locked = any(
+                    ctx is not None and (ctx.is_autonomy_locked or ctx.is_execution_locked)
+                    for ctx in governance_context_by_context.values()
+                )
 
                 is_stable = True
                 for key, analysis in context_analysis_results.items():
@@ -673,6 +701,33 @@ class StrategicOrchestrator:
                     TelemetryEvent(now, "CRITICAL_ERROR", "Orchestrator", payload={"error": str(e)},
                                    is_replay=is_replay))
                 return None
+
+    def _resolve_governance_context(
+            self,
+            context: StrategicContext,
+            human: AIHuman
+    ) -> Optional[RuntimeGovernanceContext]:
+        if self.governance_context_resolver:
+            try:
+                resolved = self.governance_context_resolver(context, human)
+                if isinstance(resolved, RuntimeGovernanceContext):
+                    return resolved
+                candidate = getattr(resolved, "context", None)
+                if isinstance(candidate, RuntimeGovernanceContext):
+                    return candidate
+            except Exception as exc:
+                self.observer.on_telemetry(
+                    TelemetryEvent(
+                        self.time_source.now(),
+                        "GOVERNANCE_RESOLVER_ERROR",
+                        "Orchestrator",
+                        context_id=context.domain,
+                        payload={"error": str(exc)},
+                    )
+                )
+        if self.governance_provider:
+            return self.governance_provider.get_context()
+        return None
 
     def _build_scoped_signals(
             self,
@@ -799,3 +854,20 @@ class StrategicOrchestrator:
             timestamp=now
         )
         self.counterfactual_store.append(event)
+        if self.upward_aggregation_service:
+            try:
+                self.upward_aggregation_service.record_counterfactual(
+                    context_domain=context.domain,
+                    stage=stage,
+                    reason=reason,
+                )
+            except Exception as exc:
+                self.observer.on_telemetry(
+                    TelemetryEvent(
+                        now,
+                        "HIERARCHY_COUNTERFACTUAL_AGGREGATION_ERROR",
+                        "Orchestrator",
+                        context_id=context.domain,
+                        payload={"error": str(exc)},
+                    )
+                )
