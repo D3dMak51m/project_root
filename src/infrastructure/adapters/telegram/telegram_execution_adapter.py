@@ -13,15 +13,6 @@ from src.infrastructure.adapters.telegram.telegram_idempotency import TelegramId
 from src.integration.registry import ExecutionAdapterRegistry
 
 
-# Assuming we have access to a global observer or we inject it.
-# For T3 compliance "Admin Telemetry", the adapter should ideally emit telemetry.
-# However, ExecutionAdapter interface doesn't include observer.
-# Telemetry is usually handled by the Orchestrator upon receiving the result.
-# But T3 prompt says "Admin Telemetry: ... TELEGRAM_MESSAGE_SENT ...".
-# If this is a specific event type, the Orchestrator emits it based on result.
-# Or the adapter includes it in observations.
-# We will include specific flags in observations for the Orchestrator/Observer to pick up.
-
 class TelegramExecutionAdapter(ExecutionAdapter):
     """
     Outbound-only execution adapter for Telegram.
@@ -80,8 +71,7 @@ class TelegramExecutionAdapter(ExecutionAdapter):
                 effects=["message_sent"],
                 costs={"api_calls": 1.0},
                 observations={
-                    "message_id": result.get("message_id"),
-                    "telemetry_event": "TELEGRAM_MESSAGE_SENT"  # Hint for observer
+                    "message_id": result.get("message_id")
                 }
             )
 

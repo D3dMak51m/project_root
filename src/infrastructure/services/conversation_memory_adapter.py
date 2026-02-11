@@ -12,17 +12,24 @@ class ConversationMemoryAdapter:
     def __init__(self, store: WorldObservationStore):
         self.store = store
 
-    def get_recent_context(self, chat_id: str, limit: int = 10) -> List[WorldObservation]:
+    def get_recent_context(self, context_domain: str, limit: int = 10) -> List[WorldObservation]:
         """
-        Returns the last N observations relevant to the given chat_id.
+        Returns the last N observations relevant to the given context_domain.
         """
         all_obs = self.store.list_all()
 
-        # Filter by chat_id in interaction metadata
-        # Assuming InteractionEvent has chat_id
+        # Filter by context domain first. Fallback to deterministic telegram domain mapping
+        # for observations produced before context_domain was added.
         relevant_obs = [
             obs for obs in all_obs
-            if obs.interaction and obs.interaction.chat_id == chat_id
+            if (
+                obs.context_domain == context_domain
+                or (
+                    not obs.context_domain
+                    and obs.interaction
+                    and f"telegram:{obs.interaction.chat_id}" == context_domain
+                )
+            )
         ]
 
         # Sort by timestamp descending (newest first) then take limit

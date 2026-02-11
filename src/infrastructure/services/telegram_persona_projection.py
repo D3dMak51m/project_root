@@ -1,3 +1,5 @@
+import html
+
 from src.core.domain.execution_intent import ExecutionIntent
 from src.core.domain.persona import PersonaMask
 
@@ -29,8 +31,7 @@ class TelegramPersonaProjectionService:
             formatted_text = f"{formatted_text}"  # Placeholder for casualizing
 
         # 3. Apply Safety Formatting (HTML escaping)
-        # Simple replacement for demo; use a library like 'html' in prod
-        safe_text = formatted_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        safe_text = html.escape(formatted_text)
 
         # 4. Construct Payload
         return {

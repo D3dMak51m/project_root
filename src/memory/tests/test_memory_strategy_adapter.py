@@ -9,7 +9,10 @@ def test_adapter_determinism():
         failure_pressure=1.0,
         recent_success=True,
         instability_detected=False,
-        governance_suppressed_ratio=0.0
+        governance_suppressed_ratio=0.0,
+        missed_opportunity_pressure=0.0,
+        governance_friction_index=0.0,
+        policy_conflict_density=0.0
     )
 
     ctx1 = adapter.adapt(signal)
@@ -24,7 +27,10 @@ def test_high_failure_pressure():
         failure_pressure=3.0,  # High
         recent_success=False,
         instability_detected=False,
-        governance_suppressed_ratio=0.0
+        governance_suppressed_ratio=0.0,
+        missed_opportunity_pressure=0.0,
+        governance_friction_index=0.0,
+        policy_conflict_density=0.0
     )
 
     ctx = adapter.adapt(signal)
@@ -39,7 +45,10 @@ def test_instability_cooldown():
         failure_pressure=0.0,
         recent_success=False,
         instability_detected=True,
-        governance_suppressed_ratio=0.0
+        governance_suppressed_ratio=0.0,
+        missed_opportunity_pressure=0.0,
+        governance_friction_index=0.0,
+        policy_conflict_density=0.0
     )
 
     ctx = adapter.adapt(signal)
@@ -54,7 +63,10 @@ def test_success_boost():
         failure_pressure=0.0,
         recent_success=True,
         instability_detected=False,
-        governance_suppressed_ratio=0.0
+        governance_suppressed_ratio=0.0,
+        missed_opportunity_pressure=0.0,
+        governance_friction_index=0.0,
+        policy_conflict_density=0.0
     )
 
     ctx = adapter.adapt(signal)
@@ -69,7 +81,10 @@ def test_governance_suppression():
         failure_pressure=0.0,
         recent_success=False,
         instability_detected=False,
-        governance_suppressed_ratio=0.5  # High
+        governance_suppressed_ratio=0.5,  # High
+        missed_opportunity_pressure=0.0,
+        governance_friction_index=0.0,
+        policy_conflict_density=0.0
     )
 
     ctx = adapter.adapt(signal)

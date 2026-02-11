@@ -12,6 +12,9 @@ from src.core.persistence.in_memory_backend import InMemoryStrategicStateBackend
 from src.core.orchestration.strategic_orchestrator import StrategicOrchestrator
 from src.core.lifecycle.signals import LifeSignals
 from src.core.observability.null_observer import NullStrategicObserver
+from src.core.interfaces.execution_adapter import ExecutionAdapter
+from src.core.domain.execution_intent import ExecutionIntent
+from src.core.domain.execution_result import ExecutionResult, ExecutionStatus, ExecutionFailureType
 from src.core.domain.entity import AIHuman
 from src.core.domain.identity import Identity
 from src.core.domain.behavior import BehaviorState
@@ -21,6 +24,20 @@ from src.core.domain.readiness import ActionReadiness
 from src.core.domain.strategy import StrategicPosture, StrategicMode
 from src.core.domain.strategic_context import StrategicContext
 from src.core.domain.persona import PersonaMask
+from src.execution.queue.execution_queue import InMemoryExecutionQueue
+from src.execution.runtime.execution_runtime import ExecutionRuntime, ExecutionRuntimeConfig
+from src.integration.registry import ExecutionAdapterRegistry
+
+
+class DevExecutionAdapter(ExecutionAdapter):
+    def execute(self, intent: ExecutionIntent) -> ExecutionResult:
+        return ExecutionResult(
+            status=ExecutionStatus.SUCCESS,
+            timestamp=datetime.now(timezone.utc),
+            effects=["dev_executed"],
+            observations={"intent_id": str(intent.id)},
+            failure_type=ExecutionFailureType.NONE,
+        )
 
 
 def main():
@@ -31,14 +48,27 @@ def main():
     ledger = InMemoryStrategicLedger()
     backend = InMemoryStrategicStateBackend()
     observer = NullStrategicObserver()
+    queue = InMemoryExecutionQueue()
+    registry = ExecutionAdapterRegistry()
+    registry.register("default", DevExecutionAdapter())
+    registry.register("dev", DevExecutionAdapter())
 
     # 2. Orchestrator
     orchestrator = StrategicOrchestrator(
         time_source=time_source,
         ledger=ledger,
         backend=backend,
-        observer=observer
+        observer=observer,
+        adapter_registry=registry,
+        execution_queue=queue,
     )
+    runtime = ExecutionRuntime(
+        orchestrator=orchestrator,
+        adapter_registry=registry,
+        queue=queue,
+        config=ExecutionRuntimeConfig(worker_count=1, start_embedded_workers=True),
+    )
+    runtime.start()
 
     # 3. AIHuman
     # Using direct instantiation as no factory method exists in the provided context for AIHuman creation from scratch.
@@ -102,6 +132,7 @@ def main():
         print(f"Tick {i}: {status}")
 
     print("Dev run complete.")
+    runtime.stop()
 
 
 if __name__ == "__main__":

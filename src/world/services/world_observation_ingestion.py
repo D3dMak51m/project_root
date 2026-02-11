@@ -28,5 +28,5 @@ class WorldObservationIngestionService:
             timestamp=datetime.now(timezone.utc),
             event_type="WORLD_OBSERVATION_ADDED",
             source_component="WorldIngestion",
-            payload={"source": source}
+            payload={"source": source, "context_domain": observation.context_domain}
         ))

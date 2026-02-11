@@ -20,3 +20,6 @@ class ContextBuffer:
         items = list(self._buffer)
         self._buffer.clear()
         return items
+
+    def depth(self) -> int:
+        return len(self._buffer)

@@ -1,4 +1,5 @@
 from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import replace
 from datetime import datetime
 from uuid import uuid4
 
@@ -8,7 +9,7 @@ from src.core.domain.strategic_context import StrategicContext
 from src.core.domain.execution_intent import ExecutionIntent
 from src.core.domain.resource import StrategicResourceBudget, ResourceCost
 from src.core.domain.budget_snapshot import BudgetSnapshot
-from src.core.domain.execution_result import ExecutionResult, ExecutionStatus
+from src.core.domain.execution_result import ExecutionResult, ExecutionStatus, ExecutionFailureType
 from src.core.lifecycle.signals import LifeSignals
 from src.core.lifecycle.lifeloop import LifeLoop
 from src.core.orchestration.strategic_context_runtime import StrategicContextRuntime
@@ -64,6 +65,7 @@ from src.memory.domain.strategic_learning_signal import StrategicLearningSignal
 from src.memory.domain.meta_learning_policy import MetaLearningPolicy
 from src.memory.domain.meta_learning_context import MetaLearningContext
 from src.memory.services.meta_learning_resolver import MetaLearningResolver
+from src.infrastructure.services.telegram_persona_projection import TelegramPersonaProjectionService
 from world.context.context_buffer import ContextBuffer
 from world.store.world_observation_store import WorldObservationStore
 
@@ -103,6 +105,7 @@ class StrategicOrchestrator:
             learning_policy_adapter: Optional[LearningPolicyAdapter] = None,
             meta_learning_resolver: Optional[MetaLearningResolver] = None,
             meta_learning_policy: Optional[MetaLearningPolicy] = None,
+            persona_projection_service: Optional[TelegramPersonaProjectionService] = None,
             context_buffer: Optional[ContextBuffer] = None,
             world_store: Optional[WorldObservationStore] = None
     ):
@@ -145,6 +148,7 @@ class StrategicOrchestrator:
 
         self.meta_learning_resolver = meta_learning_resolver or MetaLearningResolver()
         self.meta_learning_policy = meta_learning_policy or MetaLearningPolicy.default()
+        self.persona_projection_service = persona_projection_service or TelegramPersonaProjectionService()
 
         self._ticks_since_failure = 100
 
@@ -228,6 +232,7 @@ class StrategicOrchestrator:
     def register_context(self, context: StrategicContext, human: AIHuman) -> None:
         key = str(context)
         if key in self._runtimes:
+            self._runtimes[key].human = human
             return
 
         replay_engine = StrategicReplayEngine(
@@ -247,6 +252,7 @@ class StrategicOrchestrator:
         runtime = StrategicContextRuntime(
             context=context,
             lifeloop=lifeloop,
+            human=human,
             tick_count=0,
             active=True
         )
@@ -273,19 +279,8 @@ class StrategicOrchestrator:
                 governance_context = self.governance_provider.get_context()
 
             # 0.1 Ingest Buffered Observations [NEW]
-            # Pull observations from buffer into current tick's signals
-            # This makes the world visible to the LifeLoop
+            # Pull observations from buffer; each context receives only its scoped subset.
             new_observations = self.context_buffer.pop_all()
-
-            # Convert observations to signal format (simplified for now)
-            # In a real system, we'd have a proper mapper.
-            # Here we just append descriptions to memories to let LifeLoop "see" them.
-            for obs in new_observations:
-                if obs.interaction:
-                    signals.memories.append(
-                        f"Observed interaction: {obs.interaction.message_type} from {obs.interaction.user_id}")
-                elif obs.signal:
-                    signals.memories.append(f"Observed signal: {obs.signal.source_id}")
 
             # 1. Recover Resources
             recovery_delta = self.resource_manager.calculate_recovery_delta(self._budget, now)
@@ -293,12 +288,14 @@ class StrategicOrchestrator:
                 self._emit_budget_event("BUDGET_RECOVERED", recovery_delta, "Time-based recovery", now)
 
             # 2. Inject Feedback
+            effective_execution_feedback = signals.execution_feedback
             if self._last_execution_result:
-                signals.execution_feedback = self._last_execution_result
+                effective_execution_feedback = self._last_execution_result
                 self._last_execution_result = None
 
-                # Update failure tracker
-                if signals.execution_feedback.status in (ExecutionStatus.FAILED, ExecutionStatus.REJECTED):
+            # Update failure tracker
+            if effective_execution_feedback:
+                if effective_execution_feedback.status in (ExecutionStatus.FAILED, ExecutionStatus.REJECTED):
                     self._ticks_since_failure = 0
                 else:
                     self._ticks_since_failure += 1
@@ -320,6 +317,7 @@ class StrategicOrchestrator:
                 runtime = self._runtimes.get(key)
                 if not runtime:
                     continue
+                runtime_human = runtime.human or human
 
                 if runtime.tick_count >= self.profile.limits.max_ticks:
                     if self.profile.fail_fast:
@@ -348,9 +346,15 @@ class StrategicOrchestrator:
 
                 # C. Tick LifeLoop
                 runtime.tick_count += 1
+                scoped_signals = self._build_scoped_signals(
+                    base_signals=signals,
+                    observations=new_observations,
+                    context_domain=context.domain,
+                    execution_feedback=effective_execution_feedback
+                )
                 internal_context = runtime.lifeloop.tick(
-                    human=human,
-                    signals=signals,
+                    human=runtime_human,
+                    signals=scoped_signals,
                     strategic_context=context,
                     tick_count=runtime.tick_count,
                     last_executed_intent=self._last_executed_intent,
@@ -363,7 +367,7 @@ class StrategicOrchestrator:
                         # D. Filter by Memory Context (Cooldown)
                         if memory_context.cooldown_required:
                             if intent.risk_level > 0.1:
-                                runtime.lifeloop.suppress_pending_intentions(human)
+                                runtime.lifeloop.suppress_pending_intentions(runtime_human)
                                 self._record_counterfactual(intent, "Memory Cooldown", "Memory", governance_context,
                                                             context, now)
                                 continue
@@ -376,7 +380,7 @@ class StrategicOrchestrator:
                             candidates.append((runtime, intent, priority))
                             runtimes_with_intent.add(key)
                         else:
-                            runtime.lifeloop.suppress_pending_intentions(human)
+                            runtime.lifeloop.suppress_pending_intentions(runtime_human)
                             self._record_counterfactual(intent, "Budget Insufficient", "Budget", governance_context,
                                                         context, now)
 
@@ -407,14 +411,31 @@ class StrategicOrchestrator:
                                 winner_intent.estimated_cost)
                             self._emit_budget_event("BUDGET_RESERVED", reservation_delta,
                                                     f"Reservation for {winner_intent.id}", now)
+                            winner_human = winner_runtime.human or human
+                            winner_intent, projection_error = self._project_intent_with_persona(
+                                winner_intent, winner_human
+                            )
                             self._last_executed_intent = winner_intent
 
                             # 9. Execute (External)
                             if self.profile.allow_execution and self.runtime_phase != RuntimePhase.REPLAY:
-                                execution_result = self.adapter_registry.execute_safe(winner_intent)
+                                if projection_error:
+                                    execution_result = ResultNormalizer.failure(
+                                        reason=f"Persona projection failed: {projection_error}",
+                                        failure_type=ExecutionFailureType.INTERNAL
+                                    )
+                                else:
+                                    execution_result = self.adapter_registry.execute_safe(winner_intent)
                                 self._last_execution_result = execution_result
 
                                 self.observer.on_execution_result(execution_result, is_replay=False)
+                                self._emit_execution_telemetry(
+                                    winner_intent,
+                                    execution_result,
+                                    winner_runtime.context,
+                                    now,
+                                    is_replay=False
+                                )
 
                                 # 10. Commit/Rollback Budget
                                 if execution_result.status in (ExecutionStatus.FAILED, ExecutionStatus.REJECTED):
@@ -453,7 +474,8 @@ class StrategicOrchestrator:
             # 12. Suppress Losers
             for runtime, intent, _ in candidates:
                 if runtime != winner_runtime:
-                    runtime.lifeloop.suppress_pending_intentions(human)
+                    loser_human = runtime.human or human
+                    runtime.lifeloop.suppress_pending_intentions(loser_human)
                     self._record_counterfactual(intent, "Lost Arbitration", "Arbitration", governance_context,
                                                 runtime.context, now)
 
@@ -526,7 +548,7 @@ class StrategicOrchestrator:
                 "winner": str(winner_intent.id) if winner_intent else None}, is_replay=is_replay))
 
             return winner_intent
-
+ 
         except Exception as e:
             if self.profile.fail_fast:
                 raise PanicMode(f"Critical failure in Orchestrator: {e}") from e
@@ -535,6 +557,108 @@ class StrategicOrchestrator:
                     TelemetryEvent(now, "CRITICAL_ERROR", "Orchestrator", payload={"error": str(e)},
                                    is_replay=is_replay))
                 return None
+
+    def _build_scoped_signals(
+            self,
+            base_signals: LifeSignals,
+            observations: List[Any],
+            context_domain: str,
+            execution_feedback: Optional[ExecutionResult]
+    ) -> LifeSignals:
+        scoped_memories = list(base_signals.memories)
+
+        for obs in observations:
+            obs_domain = getattr(obs, "context_domain", None)
+            if obs_domain and obs_domain != context_domain:
+                continue
+
+            if obs.interaction:
+                scoped_memories.append(
+                    f"Observed interaction: {obs.interaction.message_type} from {obs.interaction.user_id}"
+                )
+            elif obs.signal:
+                scoped_memories.append(f"Observed signal: {obs.signal.source_id}")
+
+        return LifeSignals(
+            pressure_delta=base_signals.pressure_delta,
+            energy_delta=base_signals.energy_delta,
+            attention_delta=base_signals.attention_delta,
+            rest=base_signals.rest,
+            perceived_topics=dict(base_signals.perceived_topics),
+            memories=scoped_memories,
+            execution_feedback=execution_feedback
+        )
+
+    def _project_intent_with_persona(
+            self,
+            intent: ExecutionIntent,
+            human: AIHuman
+    ) -> Tuple[ExecutionIntent, Optional[str]]:
+        if intent.constraints.get("platform") != "telegram":
+            return intent, None
+
+        mask = None
+        for persona in human.personas:
+            if persona.id == intent.persona_id:
+                mask = persona
+                break
+
+        if not mask:
+            for persona in human.personas:
+                if persona.platform == "telegram":
+                    mask = persona
+                    break
+
+        if not mask:
+            return intent, "No persona mask available for Telegram projection"
+
+        try:
+            projection_payload = self.persona_projection_service.project(intent, mask)
+            merged_constraints = dict(intent.constraints)
+            merged_constraints.update(projection_payload)
+            return replace(intent, constraints=merged_constraints), None
+        except Exception as exc:
+            return intent, str(exc)
+
+    def _emit_execution_telemetry(
+            self,
+            intent: ExecutionIntent,
+            result: ExecutionResult,
+            context: StrategicContext,
+            now: datetime,
+            is_replay: bool
+    ) -> None:
+        platform = intent.constraints.get("platform")
+        if platform != "telegram":
+            return
+
+        if result.status == ExecutionStatus.SUCCESS and "message_sent" in result.effects:
+            self.observer.on_telemetry(TelemetryEvent(
+                timestamp=now,
+                event_type="TELEGRAM_MESSAGE_SENT",
+                source_component="Orchestrator",
+                context_id=context.domain,
+                payload={
+                    "intent_id": str(intent.id),
+                    "message_id": result.observations.get("message_id")
+                },
+                is_replay=is_replay
+            ))
+            return
+
+        if result.status in (ExecutionStatus.FAILED, ExecutionStatus.REJECTED):
+            self.observer.on_telemetry(TelemetryEvent(
+                timestamp=now,
+                event_type="TELEGRAM_MESSAGE_FAILED",
+                source_component="Orchestrator",
+                context_id=context.domain,
+                payload={
+                    "intent_id": str(intent.id),
+                    "status": result.status.value,
+                    "reason": result.reason
+                },
+                is_replay=is_replay
+            ))
 
     def _record_counterfactual(
             self,

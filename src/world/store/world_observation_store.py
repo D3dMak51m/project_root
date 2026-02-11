@@ -14,3 +14,9 @@ class WorldObservationStore:
 
     def list_all(self) -> List[WorldObservation]:
         return list(self._observations)
+
+    def list_by_context(self, context_domain: str, limit: int = 100) -> List[WorldObservation]:
+        values = [obs for obs in self._observations if obs.context_domain == context_domain]
+        if limit <= 0:
+            return []
+        return values[-limit:]

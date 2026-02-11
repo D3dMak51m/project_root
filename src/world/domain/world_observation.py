@@ -19,3 +19,4 @@ class WorldObservation:
     salience: Optional[SignalSalience] = None
     trends: List[TrendWindow] = None
     targets: Optional[TargetBinding] = None
+    context_domain: Optional[str] = None

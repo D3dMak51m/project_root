@@ -27,7 +27,8 @@ def create_event(status: ExecutionStatus, time_offset_seconds: int = 0, gov_lock
         autonomy_state_before=AutonomyState(AutonomyMode.READY, "test", 0.5, [], False),
         policy_decision=PolicyDecision(True, "OK", []),
         governance_snapshot=GovernanceSnapshot(gov_locked, False, gov_locked),
-        issued_at=FIXED_NOW - timedelta(seconds=time_offset_seconds)
+        issued_at=FIXED_NOW - timedelta(seconds=time_offset_seconds),
+        context_domain="test"
     )
 
 
@@ -99,7 +100,7 @@ def test_signal_builder():
     # e1 (10s): -1.0 * 0.9 * 1.0 * 2.0 = -1.8
     # Sum abs negative: 1.05 + 1.2 + 1.8 = 4.05 > 2.5 (Threshold)
 
-    signal = builder.build(weighted, analyzer)
+    signal = builder.build(weighted, analyzer, {})
 
     assert signal.instability_detected is True
     assert signal.recent_success is False
@@ -117,7 +118,7 @@ def test_governance_ratio():
     ]
 
     weighted = analyzer.analyze(events, FIXED_NOW)
-    signal = builder.build(weighted, analyzer)
+    signal = builder.build(weighted, analyzer, {})
 
     # 1 out of 2 recent events suppressed
     assert signal.governance_suppressed_ratio == 0.5

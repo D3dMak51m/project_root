@@ -1,4 +1,4 @@
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 from datetime import datetime, timezone
 from src.core.interfaces.execution_adapter import ExecutionAdapter
 from src.core.domain.execution_intent import ExecutionIntent
@@ -24,10 +24,21 @@ class ExecutionAdapterRegistry:
     def register(self, platform: str, adapter: ExecutionAdapter) -> None:
         self._adapters[platform] = adapter
 
-    def resolve(self, intent: ExecutionIntent) -> Optional[ExecutionAdapter]:
-        # Logic to determine platform from intent constraints
-        # We look for 'platform' key in constraints
-        platform = intent.constraints.get("platform", "default")
+    def resolve(self, intent: Any) -> Optional[ExecutionAdapter]:
+        """
+        Resolve adapter for both ExecutionIntent (constraints-based) and
+        interaction-style intents used by legacy dispatcher tests.
+        """
+        platform = "default"
+
+        constraints = getattr(intent, "constraints", None)
+        if isinstance(constraints, dict):
+            platform = str(constraints.get("platform", "default"))
+        else:
+            metadata = getattr(intent, "metadata", None)
+            if isinstance(metadata, dict):
+                platform = str(metadata.get("platform", "default"))
+
         return self._adapters.get(platform)
 
     def execute_safe(self, intent: ExecutionIntent) -> ExecutionResult:

@@ -21,7 +21,12 @@ def create_dummy_context(salience_score=0.5, uncertainties=None):
 
     signal = NormalizedSignal(uuid4(), "src", datetime.now(timezone.utc), datetime.now(timezone.utc), "content", {})
     salience = SignalSalience(signal.signal_id, "src", signal.received_at, 0.5, 0.5, 0.5, salience_score)
-    obs = WorldObservation(signal, salience, [], TargetBinding(signal.signal_id))
+    obs = WorldObservation(
+        signal=signal,
+        salience=salience,
+        trends=[],
+        targets=TargetBinding(signal.signal_id)
+    )
 
     interp = SemanticInterpretation([], [], [], Sentiment.NEUTRAL, [], TimeHorizon.SHORT)
     reasoning = ReasoningBundle([], [], [], [], [], uncertainties)

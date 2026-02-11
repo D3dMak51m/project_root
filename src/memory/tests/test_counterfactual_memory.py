@@ -40,7 +40,7 @@ def test_analyzer_metrics():
 
     # Pressure: (0.1 + 0.1 + 0.5 + 0.1) = 0.8. Normalized by (4/10) = 0.4. Result = 2.0?
     # Logic: pressure / max(1, total/10). 0.8 / 1 = 0.8.
-    assert metrics["missed_opportunity_pressure"] == 0.8
+    assert metrics["missed_opportunity_pressure"] == pytest.approx(0.8)
 
 
 def test_empty_analysis():

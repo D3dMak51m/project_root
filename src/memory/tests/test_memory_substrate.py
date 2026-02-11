@@ -26,7 +26,8 @@ def create_event(status: ExecutionStatus, intent_id: UUID = None) -> EventRecord
         autonomy_state_before=AutonomyState(AutonomyMode.READY, "test", 0.5, [], False),
         policy_decision=PolicyDecision(True, "OK", []),
         governance_snapshot=GovernanceSnapshot.empty(),
-        issued_at=FIXED_TIME
+        issued_at=FIXED_TIME,
+        context_domain="test"
     )
 
 

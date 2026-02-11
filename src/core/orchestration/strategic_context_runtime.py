@@ -1,5 +1,7 @@
 from dataclasses import dataclass
+from typing import Optional
 from src.core.domain.strategic_context import StrategicContext
+from src.core.domain.entity import AIHuman
 from src.core.lifecycle.lifeloop import LifeLoop
 
 
@@ -12,6 +14,7 @@ class StrategicContextRuntime:
     """
     context: StrategicContext
     lifeloop: LifeLoop
+    human: Optional[AIHuman] = None
     tick_count: int = 0
     active: bool = True
 
