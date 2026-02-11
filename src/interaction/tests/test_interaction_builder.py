@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from src.interaction.domain.context import InteractionContext
 from src.interaction.domain.intent import InteractionType
 from src.interaction.services.builder import StandardInteractionBuilder
-from src.world.domain.observation import WorldObservation
+from src.world.domain.world_observation import WorldObservation
 from src.world.domain.signal import NormalizedSignal
 from src.world.domain.salience import SignalSalience
 from src.world.domain.target import TargetBinding

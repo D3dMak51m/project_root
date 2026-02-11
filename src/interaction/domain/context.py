@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from typing import List
-from src.world.domain.observation import WorldObservation
+from src.world.domain.world_observation import WorldObservation
 from src.cognitive.domain.semantic_interpretation import SemanticInterpretation
 from src.cognitive.domain.reasoning_bundle import ReasoningBundle
 from src.cognitive.domain.narrative_report import NarrativeReport

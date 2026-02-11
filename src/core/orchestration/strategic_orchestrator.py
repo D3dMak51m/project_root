@@ -64,6 +64,8 @@ from src.memory.domain.strategic_learning_signal import StrategicLearningSignal
 from src.memory.domain.meta_learning_policy import MetaLearningPolicy
 from src.memory.domain.meta_learning_context import MetaLearningContext
 from src.memory.services.meta_learning_resolver import MetaLearningResolver
+from world.context.context_buffer import ContextBuffer
+from world.store.world_observation_store import WorldObservationStore
 
 
 class StrategicOrchestrator:
@@ -100,7 +102,9 @@ class StrategicOrchestrator:
             learning_extractor: Optional[LearningExtractor] = None,
             learning_policy_adapter: Optional[LearningPolicyAdapter] = None,
             meta_learning_resolver: Optional[MetaLearningResolver] = None,
-            meta_learning_policy: Optional[MetaLearningPolicy] = None
+            meta_learning_policy: Optional[MetaLearningPolicy] = None,
+            context_buffer: Optional[ContextBuffer] = None,
+            world_store: Optional[WorldObservationStore] = None
     ):
         self.time_source = time_source
         self.ledger = ledger
@@ -150,6 +154,9 @@ class StrategicOrchestrator:
 
         # Initialize Budget (Event Sourced)
         self._budget = self._restore_budget()
+
+        self.context_buffer = context_buffer or ContextBuffer()
+        self.world_store = world_store or WorldObservationStore()
 
         # Enforce Profile Constraints
         if self.profile.env == Environment.REPLAY:
@@ -264,6 +271,21 @@ class StrategicOrchestrator:
             governance_context = None
             if self.governance_provider:
                 governance_context = self.governance_provider.get_context()
+
+            # 0.1 Ingest Buffered Observations [NEW]
+            # Pull observations from buffer into current tick's signals
+            # This makes the world visible to the LifeLoop
+            new_observations = self.context_buffer.pop_all()
+
+            # Convert observations to signal format (simplified for now)
+            # In a real system, we'd have a proper mapper.
+            # Here we just append descriptions to memories to let LifeLoop "see" them.
+            for obs in new_observations:
+                if obs.interaction:
+                    signals.memories.append(
+                        f"Observed interaction: {obs.interaction.message_type} from {obs.interaction.user_id}")
+                elif obs.signal:
+                    signals.memories.append(f"Observed signal: {obs.signal.source_id}")
 
             # 1. Recover Resources
             recovery_delta = self.resource_manager.calculate_recovery_delta(self._budget, now)

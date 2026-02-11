@@ -13,6 +13,15 @@ from src.infrastructure.adapters.telegram.telegram_idempotency import TelegramId
 from src.integration.registry import ExecutionAdapterRegistry
 
 
+# Assuming we have access to a global observer or we inject it.
+# For T3 compliance "Admin Telemetry", the adapter should ideally emit telemetry.
+# However, ExecutionAdapter interface doesn't include observer.
+# Telemetry is usually handled by the Orchestrator upon receiving the result.
+# But T3 prompt says "Admin Telemetry: ... TELEGRAM_MESSAGE_SENT ...".
+# If this is a specific event type, the Orchestrator emits it based on result.
+# Or the adapter includes it in observations.
+# We will include specific flags in observations for the Orchestrator/Observer to pick up.
+
 class TelegramExecutionAdapter(ExecutionAdapter):
     """
     Outbound-only execution adapter for Telegram.
@@ -34,16 +43,16 @@ class TelegramExecutionAdapter(ExecutionAdapter):
                 observations={"deduplicated": True, "original_meta": self.idempotency.get_metadata(intent.id)}
             )
 
-        # 2. Validate Intent Platform (Safety check)
-        # Assuming intent constraints or abstract_action implies platform,
-        # but here we check if it was routed correctly.
-        # For T1, we assume if it reached here, it's for Telegram.
+        # 2. Validate Intent Platform
+        if intent.constraints.get("platform") != "telegram":
+            return ResultNormalizer.rejection(
+                reason=f"Invalid platform for TelegramAdapter: {intent.constraints.get('platform')}"
+            )
 
         # 3. Extract Payload
-        # ExecutionIntent constraints/metadata should hold the payload
-        # We look for 'text' and 'target_id' in constraints
         text = intent.constraints.get("text")
         target_id = intent.constraints.get("target_id") or self.default_chat_id
+        parse_mode = intent.constraints.get("parse_mode")  # Optional, from projection service
 
         if not text:
             return ResultNormalizer.failure(
@@ -59,20 +68,21 @@ class TelegramExecutionAdapter(ExecutionAdapter):
 
         # 4. Execute via Client
         try:
-            # Use None for parse_mode to be safe by default, or HTML if needed
             result = self.client.send_message(
                 chat_id=target_id,
                 text=text,
-                parse_mode=None
+                parse_mode=parse_mode
             )
 
-            # Mark as processed
             self.idempotency.mark_processed(intent.id, {"message_id": result.get("message_id")})
 
             return ResultNormalizer.success(
                 effects=["message_sent"],
                 costs={"api_calls": 1.0},
-                observations={"message_id": result.get("message_id")}
+                observations={
+                    "message_id": result.get("message_id"),
+                    "telemetry_event": "TELEGRAM_MESSAGE_SENT"  # Hint for observer
+                }
             )
 
         except TelegramRateLimitError as e:
@@ -99,7 +109,8 @@ class TelegramExecutionAdapter(ExecutionAdapter):
             return ResultNormalizer.failure(
                 reason=f"Telegram API error: {str(e)}",
                 failure_type=ExecutionFailureType.ENVIRONMENT,
-                costs={"api_calls": 1.0}
+                costs={"api_calls": 1.0},
+                timestamp=None  # Normalizer handles timestamp
             )
 
         except Exception as e:
@@ -109,10 +120,7 @@ class TelegramExecutionAdapter(ExecutionAdapter):
             )
 
 
-# Explicit Registration (Side-effect on import)
-# In a real app, this might be done in a bootstrap phase, but for T1 compliance:
-# We register a placeholder or rely on manual instantiation in main.
-# However, to satisfy the "Explicit Registration" requirement without hardcoding tokens:
+# Explicit Registration
 def register_telegram_adapter(token: str, default_chat_id: Optional[str] = None):
     registry = ExecutionAdapterRegistry.get_global()
     registry.register("telegram", TelegramExecutionAdapter(token, default_chat_id))

@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import List
 from src.world.domain.signal import NormalizedSignal
-from src.world.domain.observation import WorldObservation
+from src.world.domain.world_observation import WorldObservation
 
 class CognitiveFeed(ABC):
     """
